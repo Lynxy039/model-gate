@@ -1,0 +1,211 @@
+import threading
+import unittest
+from unittest.mock import Mock, patch
+from urllib.error import URLError
+
+from model_gate.gate import AdmissionGate, AdmissionPolicy
+from model_gate.proxy import Backend, Lifecycle, LifecycleError, ProcessManager
+from model_gate.router import ModelRouter
+
+
+class AdmissionGateTests(unittest.TestCase):
+    def setUp(self):
+        self.gate = AdmissionGate({
+            ("omlx", "coder"): AdmissionPolicy(8, "light"),
+            ("omlx", "thinking"): AdmissionPolicy(2, "light"),
+            ("omlx", "heavy-122b"): AdmissionPolicy(),
+            ("ds4", "flash"): AdmissionPolicy(),
+        })
+
+    def test_light_models_run_together(self):
+        coder = self.gate.acquire("omlx", "coder")
+        coder.mark_ready()
+        thinking = self.gate.acquire("omlx", "thinking")
+        thinking.mark_ready()
+
+        self.assertEqual(self.gate.snapshot()["active"], 2)
+        coder.release()
+        thinking.release()
+
+    def test_heavy_model_waits_for_every_light_request(self):
+        coder = self.gate.acquire("omlx", "coder")
+        coder.mark_ready()
+        thinking = self.gate.acquire("omlx", "thinking")
+        thinking.mark_ready()
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(self.gate.acquire("omlx", "heavy-122b"))
+        )
+        thread.start()
+        self.assertTrue(thread.is_alive())
+
+        coder.release()
+        self.assertTrue(thread.is_alive())
+        thinking.release()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        result[0].release()
+
+    def test_exclusive_waiter_blocks_new_light_work(self):
+        coder = self.gate.acquire("omlx", "coder")
+        coder.mark_ready()
+        heavy = []
+        later_light = []
+        heavy_thread = threading.Thread(
+            target=lambda: heavy.append(self.gate.acquire("ds4", "flash"))
+        )
+        light_thread = threading.Thread(
+            target=lambda: later_light.append(self.gate.acquire("omlx", "thinking"))
+        )
+        heavy_thread.start()
+        light_thread.start()
+        self.assertTrue(light_thread.is_alive())
+
+        coder.release()
+        heavy_thread.join(timeout=1)
+        self.assertEqual(len(heavy), 1)
+        self.assertTrue(light_thread.is_alive())
+        heavy[0].release()
+        light_thread.join(timeout=1)
+        later_light[0].release()
+
+    def test_ds4_is_limited_to_one(self):
+        first = self.gate.acquire("ds4", "flash")
+        first.mark_ready()
+        result = []
+        thread = threading.Thread(target=lambda: result.append(self.gate.acquire("ds4", "flash")))
+        thread.start()
+        self.assertTrue(thread.is_alive())
+        first.release()
+        thread.join(timeout=1)
+        self.assertEqual(len(result), 1)
+        result[0].release()
+
+
+class ProcessManagerTests(unittest.TestCase):
+    def test_autostart_runs_once_and_waits_for_ready(self):
+        backend = Backend(
+            "ds4", "http://ds4", 1,
+            autostart_command=["zsh", "-lic", "ds4run"],
+            startup_timeout=1,
+            startup_poll_seconds=0,
+        )
+        manager = ProcessManager({"ds4": backend})
+        process = Mock()
+        process.poll.return_value = None
+        response = Mock()
+        response.status = 200
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+
+        with patch("model_gate.proxy.subprocess.Popen", return_value=process) as popen:
+            with patch("model_gate.proxy.urlopen", side_effect=[URLError("down"), response, response]):
+                manager.ensure_ready("ds4")
+                manager.ensure_ready("ds4")
+
+        popen.assert_called_once_with(
+            ["zsh", "-lic", "ds4run"],
+            start_new_session=True,
+            stdout=unittest.mock.ANY,
+            stderr=unittest.mock.ANY,
+        )
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_light_models_load_without_unloading_each_other(self):
+        backends = {
+            "omlx": Backend(
+                "omlx", "http://omlx", 1,
+                model_policies={"coder": {"sharing_group": "light"}, "thinking": {"sharing_group": "light"}},
+                load_url="http://omlx/load/{model}",
+                unload_url="http://omlx/unload/{model}",
+            ),
+        }
+        lifecycle = Lifecycle(backends)
+        calls = []
+        lifecycle._post = calls.append
+
+        lifecycle.activate("omlx", "coder", "light")
+        lifecycle.activate("omlx", "thinking", "light")
+
+        self.assertEqual(calls, ["http://omlx/load/coder", "http://omlx/load/thinking"])
+
+    def test_evicted_model_is_loaded_again_after_ttl(self):
+        backends = {
+            "omlx": Backend("omlx", "http://omlx", 1, load_url="http://omlx/load/{model}"),
+        }
+        lifecycle = Lifecycle(backends)
+        calls = []
+        lifecycle._post = calls.append
+
+        lifecycle.activate("omlx", "coder", "light")
+        lifecycle._is_loaded = lambda *_: False
+        lifecycle.activate("omlx", "coder", "light")
+
+        self.assertEqual(calls, ["http://omlx/load/coder", "http://omlx/load/coder"])
+
+    def test_heavy_model_unloads_light_pool_before_loading(self):
+        backends = {
+            "omlx": Backend(
+                "omlx", "http://omlx", 1,
+                model_policies={"coder": {"sharing_group": "light"}},
+                load_url="http://omlx/load/{model}",
+                unload_url="http://omlx/unload/{model}",
+            ),
+        }
+        lifecycle = Lifecycle(backends)
+        calls = []
+        lifecycle._post = calls.append
+
+        lifecycle.activate("omlx", "coder", "light")
+        lifecycle.activate("omlx", "heavy-122b", None)
+
+        self.assertEqual(calls, [
+            "http://omlx/load/coder",
+            "http://omlx/unload/coder",
+            "http://omlx/load/heavy-122b",
+        ])
+
+    def test_switch_without_unload_hook_fails_closed_for_resident_backend(self):
+        backends = {
+            "omlx": Backend("omlx", "http://omlx", 1),
+            "ds4": Backend("ds4", "http://ds4", 1, requires_unload=False),
+        }
+        lifecycle = Lifecycle(backends)
+        lifecycle.activate("omlx", "coder", None)
+        with self.assertRaises(LifecycleError):
+            lifecycle.activate("ds4", "flash", None)
+
+    def test_ephemeral_ds4_needs_no_unload_hook(self):
+        backends = {
+            "omlx": Backend("omlx", "http://omlx", 1, load_url="http://omlx/load/{model}"),
+            "ds4": Backend("ds4", "http://ds4", 1, requires_unload=False),
+        }
+        lifecycle = Lifecycle(backends)
+        calls = []
+        lifecycle._post = calls.append
+
+        lifecycle.activate("ds4", "flash", None)
+        lifecycle.activate("omlx", "coder", "light")
+
+        self.assertEqual(calls, ["http://omlx/load/coder"])
+
+
+class ModelRouterTests(unittest.TestCase):
+    def test_routes_by_longest_prefix(self):
+        router = ModelRouter({
+            "omlx": {"prefixes": ["qwen"]},
+            "ds4": {"prefixes": ["deepseek-v4"]},
+        })
+        self.assertEqual(router.backend_for("deepseek-v4-flash"), "ds4")
+        self.assertEqual(router.backend_for("qwen3-coder-next"), "omlx")
+
+    def test_unknown_model_is_rejected(self):
+        router = ModelRouter({"omlx": {"models": ["known"]}})
+        with self.assertRaises(ValueError):
+            router.backend_for("unknown")
+
+
+if __name__ == "__main__":
+    unittest.main()
