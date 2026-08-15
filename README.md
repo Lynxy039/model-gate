@@ -30,6 +30,17 @@ cp model-gate.example.json model-gate.json
 python3.11 -m model_gate --config model-gate.json
 ```
 
+Прокси пишет в stderr по каждому запросу модель, backend, режим `stream`,
+примерный размер контекста в `context_chars`, HTTP-статус и длительность.
+`context_chars` — это число символов в `messages` (не точный token count);
+для точного подсчёта нужен отдельный tokenizer или `usage` от backend-а.
+
+Если у backend-а включён `discover_models: true`, proxy запрашивает его
+`model_list_path` (по умолчанию `/v1/models`) при запуске и обновляет список
+при `GET /v1/models`. Недоступный backend не мешает запуску. В example-конфиге
+включено обнаружение для портов 8000–8003; backend-ы без `/v1/models` просто
+останутся без обнаруженных моделей.
+
 В `models.json` Pi нужно направить оба провайдера на proxy, например:
 
 ```json
