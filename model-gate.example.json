@@ -5,10 +5,18 @@
   "upstream_timeout": 600,
   "lifecycle_failure_cooldown": 5,
   "max_body_bytes": 67108864,
+  "model_discovery_timeout": 3,
   "backends": {
+    "port-8000": {
+      "base_url": "http://127.0.0.1:8000",
+      "max_concurrency": 1,
+      "discover_models": true,
+      "requires_unload": false
+    },
     "omlx": {
       "base_url": "http://127.0.0.1:8001",
       "max_concurrency": 1,
+      "discover_models": true,
       "model_policies": {
         "mlx-community--Qwen3-Coder-Next-nvfp4": {"max_concurrency": 8, "sharing_group": "light"},
         "ThinkingCap-Qwen3.6-27B-oQ6e-mtp": {"max_concurrency": 2, "sharing_group": "light"},
@@ -27,9 +35,16 @@
       "unload_url": "http://127.0.0.1:8001/admin/api/models/{model}/unload",
       "load_url": "http://127.0.0.1:8001/admin/api/models/{model}/load"
     },
+    "mtplx": {
+      "base_url": "http://127.0.0.1:8002",
+      "max_concurrency": 1,
+      "discover_models": true,
+      "requires_unload": false
+    },
     "ds4": {
       "base_url": "http://127.0.0.1:8003",
       "max_concurrency": 1,
+      "discover_models": true,
       "requires_unload": false,
       "settle_seconds": 5,
       "ready_path": "/v1/models",

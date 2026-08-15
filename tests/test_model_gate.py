@@ -1,10 +1,11 @@
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import URLError
 
 from model_gate.gate import AdmissionGate, AdmissionPolicy
-from model_gate.proxy import Backend, Lifecycle, LifecycleError, ProcessManager
+from model_gate.proxy import Backend, GateServer, Lifecycle, LifecycleError, ProcessManager, ProxyHandler
 from model_gate.router import ModelRouter
 
 
@@ -81,6 +82,87 @@ class AdmissionGateTests(unittest.TestCase):
         thread.join(timeout=1)
         self.assertEqual(len(result), 1)
         result[0].release()
+
+
+class ProxyModelDiscoveryTests(unittest.TestCase):
+    def test_refresh_models_adds_models_returned_by_backend(self):
+        server = object.__new__(GateServer)
+        server.backends = {
+            "omlx": Backend("omlx", "http://omlx", 1, discover_models=True),
+        }
+        server._model_refresh_lock = threading.Lock()
+        server.model_discovery_timeout = 1
+        server.router = ModelRouter({})
+        response = Mock()
+        response.read.return_value = b'{"data":[{"id":"new-model"}]}'
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+
+        with patch("model_gate.proxy.urlopen", return_value=response):
+            server.refresh_models()
+
+        self.assertEqual(server.backends["omlx"].models, ["new-model"])
+        self.assertEqual(server.router.backend_for("new-model"), "omlx")
+
+    def test_model_list_refreshes_and_aggregates_backends(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/v1/models"
+        handler._json = Mock()
+        handler.server = SimpleNamespace(
+            refresh_models=Mock(),
+            backends={
+                "omlx": Backend("omlx", "http://omlx", 1, models=["coder"]),
+                "ds4": Backend("ds4", "http://ds4", 1, models=["flash"]),
+            },
+        )
+
+        ProxyHandler.do_GET(handler)
+
+        handler.server.refresh_models.assert_called_once_with()
+        handler._json.assert_called_once_with(200, {
+            "object": "list",
+            "data": [
+                {"id": "coder", "object": "model", "owned_by": "omlx"},
+                {"id": "flash", "object": "model", "owned_by": "ds4"},
+            ],
+        })
+
+
+class ProxyStreamingTests(unittest.TestCase):
+    def test_copy_stream_reads_one_upstream_chunk_and_flushes_each_time(self):
+        handler = object.__new__(ProxyHandler)
+        handler.wfile = Mock()
+        response = Mock()
+        response.read.side_effect = AssertionError("must use read1 for streaming")
+        response.read1.side_effect = [b"first", b"second", b""]
+
+        ProxyHandler._copy_stream(handler, response)
+
+        self.assertEqual(handler.wfile.write.call_args_list, [
+            unittest.mock.call(b"first"),
+            unittest.mock.call(b"second"),
+        ])
+        self.assertEqual(handler.wfile.flush.call_count, 2)
+
+    def test_client_disconnect_does_not_send_a_second_error_response(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Length": "2"}
+        handler._read_body = Mock(return_value=b'{"model":"flash"}')
+        handler._forward = Mock(side_effect=BrokenPipeError())
+        handler._json = Mock()
+        lease = Mock(initialize=False)
+        handler.server = SimpleNamespace(
+            router=SimpleNamespace(backend_for=Mock(return_value="ds4")),
+            lifecycle_available=Mock(return_value=(True, "")),
+            gate=SimpleNamespace(acquire=Mock(return_value=lease)),
+            backends={"ds4": object()},
+        )
+
+        ProxyHandler.do_POST(handler)
+
+        handler._json.assert_not_called()
+        lease.release.assert_called_once_with()
 
 
 class ProcessManagerTests(unittest.TestCase):

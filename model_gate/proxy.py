@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import logging
 from pathlib import Path
 import subprocess
 import threading
@@ -17,6 +18,14 @@ from .gate import AdmissionGate, AdmissionPolicy
 from .router import ModelRouter
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+def _context_chars(payload: dict) -> int:
+    context = payload.get("messages", payload.get("prompt", ""))
+    return len(json.dumps(context, ensure_ascii=False))
+
+
 @dataclass
 class Backend:
     name: str
@@ -25,6 +34,8 @@ class Backend:
     model_policies: dict[str, dict] = field(default_factory=dict)
     models: list[str] = field(default_factory=list)
     prefixes: list[str] = field(default_factory=list)
+    discover_models: bool = False
+    model_list_path: str = "/v1/models"
     load_url: str | None = None
     unload_url: str | None = None
     unload_all_url: str | None = None
@@ -48,6 +59,8 @@ class Backend:
             model_policies=dict(config.get("model_policies", {})),
             models=list(config.get("models", [])),
             prefixes=list(config.get("prefixes", [])),
+            discover_models=bool(config.get("discover_models", False)),
+            model_list_path=config.get("model_list_path", "/v1/models"),
             load_url=config.get("load_url"),
             unload_url=config.get("unload_url"),
             unload_all_url=config.get("unload_all_url"),
@@ -244,11 +257,13 @@ class GateServer(ThreadingHTTPServer):
             name: Backend.from_config(name, backend_config)
             for name, backend_config in config["backends"].items()
         }
+        self._model_refresh_lock = threading.Lock()
+        self.model_discovery_timeout = float(config.get("model_discovery_timeout", 3))
         self.router = ModelRouter({name: backend.__dict__ for name, backend in self.backends.items()})
         self.gate = AdmissionGate({
             (name, model): backend.admission_policy(model)
             for name, backend in self.backends.items()
-            for model in backend.models
+            for model in set(backend.models) | set(backend.model_policies)
         })
         self.lifecycle = Lifecycle(
             self.backends,
@@ -263,6 +278,31 @@ class GateServer(ThreadingHTTPServer):
         self._blocked_until = 0.0
         self._blocked_reason = ""
         super().__init__(address, handler)
+        self.refresh_models()
+
+    def refresh_models(self) -> None:
+        # ponytail: serial refresh — up to len(backends) * model_discovery_timeout
+        # while backends are down; GET /v1/models blocks on it (pi's discovery
+        # poll times out at 5s). Parallelize with ThreadPoolExecutor if that bites.
+        with self._model_refresh_lock:
+            for name, backend in self.backends.items():
+                if not backend.discover_models:
+                    continue
+                request = Request(backend.base_url + backend.model_list_path, method="GET")
+                try:
+                    with urlopen(request, timeout=self.model_discovery_timeout) as response:
+                        payload = json.loads(response.read())
+                    items = payload if isinstance(payload, list) else payload.get("data", payload.get("models", []))
+                    discovered = {
+                        item["id"]
+                        for item in items
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    }
+                    backend.models = sorted(set(backend.models) | discovered)
+                    LOGGER.info("discovered models backend=%s count=%d", name, len(discovered))
+                except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError, AttributeError, TypeError):
+                    LOGGER.warning("model discovery unavailable backend=%s", name)
+            self.router = ModelRouter({name: backend.__dict__ for name, backend in self.backends.items()})
 
     def lifecycle_available(self) -> tuple[bool, str]:
         with self.state_lock:
@@ -291,42 +331,86 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/status":
             self._json(200, self.server.gate.snapshot())
             return
-        self._json(404, {"error": "only POST /v1/* is proxied"})
+        if self.path == "/v1/models":
+            self.server.refresh_models()
+            self._json(200, {
+                "object": "list",
+                "data": [
+                    {"id": model, "object": "model", "owned_by": name}
+                    for name, backend in self.server.backends.items()
+                    for model in sorted(backend.models)
+                ],
+            })
+            return
+        self._json(404, {"error": "only GET /v1/models and POST /v1/* are proxied"})
 
     def do_POST(self) -> None:
         if not self.path.startswith("/v1/"):
             self._json(404, {"error": "only /v1/* is proxied"})
             return
 
+        started = time.monotonic()
         try:
             body = self._read_body()
             payload = json.loads(body)
             model = payload.get("model")
             if not isinstance(model, str) or not model:
                 raise ValueError("JSON field 'model' is required")
-            backend_name = self.server.router.backend_for(model)
+            try:
+                backend_name = self.server.router.backend_for(model)
+            except ValueError:
+                self.server.refresh_models()
+                backend_name = self.server.router.backend_for(model)
             available, reason = self.server.lifecycle_available()
             if not available:
+                LOGGER.warning(
+                    "request rejected model=%s status=503 reason=%s",
+                    model,
+                    reason,
+                )
                 self._json(503, {"error": f"model gate is cooling down: {reason}"})
                 return
             lease = self.server.gate.acquire(backend_name, model)
         except (ValueError, json.JSONDecodeError) as error:
+            LOGGER.warning("request rejected status=400 error=%s", error)
             self._json(400, {"error": str(error)})
             return
 
+        stream = bool(payload.get("stream", False))
+        context_chars = _context_chars(payload)
         try:
             if lease.initialize:
                 self.server.lifecycle.activate(backend_name, model, lease.sharing_group)
                 self.server.processes.ensure_ready(backend_name)
                 self.server.clear_lifecycle_failure()
                 lease.mark_ready()
-            self._forward(self.server.backends[backend_name], body)
+            status = self._forward(self.server.backends[backend_name], body)
+            LOGGER.info(
+                "request model=%s backend=%s stream=%s context_chars=%d status=%d elapsed=%.3fs",
+                model,
+                backend_name,
+                stream,
+                context_chars,
+                status,
+                time.monotonic() - started,
+            )
         except LifecycleError as error:
             self.server.block_lifecycle(str(error))
+            LOGGER.error("request model=%s backend=%s status=503 error=%s", model, backend_name, error)
             self._json(503, {"error": str(error)})
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.info(
+                "request disconnected model=%s backend=%s stream=%s elapsed=%.3fs",
+                model,
+                backend_name,
+                stream,
+                time.monotonic() - started,
+            )
         except (HTTPError, URLError, OSError) as error:
+            LOGGER.error("request model=%s backend=%s status=502 error=%s", model, backend_name, error)
             self._json(502, {"error": f"upstream request failed: {error}"})
         except Exception as error:  # keep the proxy fail-closed on malformed upstreams
+            LOGGER.exception("request model=%s backend=%s status=502", model, backend_name)
             self._json(502, {"error": f"proxy request failed: {error}"})
         finally:
             lease.release()
@@ -337,7 +421,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid or oversized Content-Length")
         return self.rfile.read(length)
 
-    def _forward(self, backend: Backend, body: bytes) -> None:
+    def _forward(self, backend: Backend, body: bytes) -> int:
         request_headers = {
             key: value
             for key, value in self.headers.items()
@@ -358,23 +442,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", content_length)
                 self.end_headers()
                 self._copy_stream(response)
-                return
+                return response.status
 
             self.send_response(response.status)
             self._copy_headers(response.headers, skip={"content-length", "connection", "transfer-encoding"})
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            for chunk in iter(lambda: response.read(64 * 1024), b""):
+            for chunk in iter(lambda: response.read1(64 * 1024), b""):
                 self.wfile.write(f"{len(chunk):X}\r\n".encode())
                 self.wfile.write(chunk)
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
+            return response.status
 
     def _copy_stream(self, response) -> None:
-        for chunk in iter(lambda: response.read(64 * 1024), b""):
+        for chunk in iter(lambda: response.read1(64 * 1024), b""):
             self.wfile.write(chunk)
-        self.wfile.flush()
+            self.wfile.flush()
 
     def _copy_headers(self, headers, skip: set[str]) -> None:
         for key, value in headers.items():
@@ -395,6 +480,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 def serve(config_path: str | Path) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     config = json.loads(Path(config_path).read_text())
     listen = config.get("listen", "127.0.0.1:9000")
     host, port = listen.rsplit(":", 1)
