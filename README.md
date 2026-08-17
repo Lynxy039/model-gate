@@ -39,15 +39,31 @@ python3.11 -m model_gate --config model-gate.json
 `model_list_path` (по умолчанию `/v1/models`) при запуске и обновляет список
 при `GET /v1/models`. Недоступный backend не мешает запуску. В example-конфиге
 включено обнаружение для портов 8000–8003; backend-ы без `/v1/models` просто
-останутся без обнаруженных моделей.
+останутся без обнаруженных моделей. Метаданные моделей от backend-а
+(`max_model_len`, `supported_parameters` и т.д.) прокидываются в ответе
+`/v1/models` как есть — клиенты видят реальный контекст без ручной
+конфигурации.
 
-В `models.json` Pi нужно направить оба провайдера на proxy, например:
+`GET /v1/models` отдаёт объединённый список всех backend-ов. Чтобы каждый
+клиентский провайдер видел только свой backend (иначе обнаруженные модели
+дублируются во всех провайдерах), используйте per-backend view:
+`GET /<backend>/v1/models` и `POST /<backend>/v1/*` (префикс отбрасывается,
+роутинг по имени модели как обычно).
+
+В `models.json` Pi направьте каждый провайдер на свой backend, например:
 
 ```json
 {
-  "baseUrl": "http://127.0.0.1:9000/v1",
-  "api": "openai-completions",
-  "apiKey": "none"
+  "model-gate-omlx": {
+    "baseUrl": "http://127.0.0.1:9000/omlx/v1",
+    "api": "openai-completions",
+    "apiKey": "none"
+  },
+  "model-gate-ds4": {
+    "baseUrl": "http://127.0.0.1:9000/ds4/v1",
+    "api": "openai-completions",
+    "apiKey": "none"
+  }
 }
 ```
 
