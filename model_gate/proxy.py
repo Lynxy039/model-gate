@@ -7,6 +7,7 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -19,6 +20,14 @@ from .router import ModelRouter
 
 
 LOGGER = logging.getLogger(__name__)
+
+BACKEND_V1_RE = re.compile(r"^/([^/]+)/v1/(.*)$")
+
+
+def _model_entry(backend: Backend, model: str) -> dict:
+    # Backend metadata (max_model_len, supported_parameters, ...) passes through
+    # as-is; id/object/owned_by are authoritative from the gate.
+    return {**backend.model_meta.get(model, {}), "id": model, "object": "model", "owned_by": backend.name}
 
 
 def _context_chars(payload: dict) -> int:
@@ -33,6 +42,7 @@ class Backend:
     max_concurrency: int
     model_policies: dict[str, dict] = field(default_factory=dict)
     models: list[str] = field(default_factory=list)
+    model_meta: dict[str, dict] = field(default_factory=dict)
     prefixes: list[str] = field(default_factory=list)
     discover_models: bool = False
     model_list_path: str = "/v1/models"
@@ -280,12 +290,14 @@ class GateServer(ThreadingHTTPServer):
         super().__init__(address, handler)
         self.refresh_models()
 
-    def refresh_models(self) -> None:
+    def refresh_models(self, only: str | None = None) -> None:
         # ponytail: serial refresh — up to len(backends) * model_discovery_timeout
         # while backends are down; GET /v1/models blocks on it (pi's discovery
         # poll times out at 5s). Parallelize with ThreadPoolExecutor if that bites.
         with self._model_refresh_lock:
             for name, backend in self.backends.items():
+                if only is not None and name != only:
+                    continue
                 if not backend.discover_models:
                     continue
                 request = Request(backend.base_url + backend.model_list_path, method="GET")
@@ -294,11 +306,12 @@ class GateServer(ThreadingHTTPServer):
                         payload = json.loads(response.read())
                     items = payload if isinstance(payload, list) else payload.get("data", payload.get("models", []))
                     discovered = {
-                        item["id"]
+                        item["id"]: {k: v for k, v in item.items() if k not in ("id", "object")}
                         for item in items
                         if isinstance(item, dict) and isinstance(item.get("id"), str)
                     }
-                    backend.models = sorted(set(backend.models) | discovered)
+                    backend.models = sorted(set(backend.models) | set(discovered))
+                    backend.model_meta.update(discovered)
                     LOGGER.info("discovered models backend=%s count=%d", name, len(discovered))
                 except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError, AttributeError, TypeError):
                     LOGGER.warning("model discovery unavailable backend=%s", name)
@@ -336,15 +349,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._json(200, {
                 "object": "list",
                 "data": [
-                    {"id": model, "object": "model", "owned_by": name}
-                    for name, backend in self.server.backends.items()
+                    _model_entry(backend, model)
+                    for backend in self.server.backends.values()
                     for model in sorted(backend.models)
                 ],
             })
             return
-        self._json(404, {"error": "only GET /v1/models and POST /v1/* are proxied"})
+        match = BACKEND_V1_RE.match(self.path)
+        if match and match.group(2) == "models":
+            name = match.group(1)
+            backend = self.server.backends.get(name)
+            if backend is None:
+                self._json(404, {"error": f"unknown backend: {name}"})
+                return
+            self.server.refresh_models(only=name)
+            self._json(200, {
+                "object": "list",
+                "data": [_model_entry(backend, model) for model in sorted(backend.models)],
+            })
+            return
+        self._json(404, {"error": "only GET /v1/models, GET /<backend>/v1/models and POST /v1/* are proxied"})
 
     def do_POST(self) -> None:
+        # /<backend>/v1/* is a per-backend view: strip the prefix, routing is
+        # still by model name (the prefix is for discovery, not access control).
+        view_backend: str | None = None
+        match = BACKEND_V1_RE.match(self.path)
+        if match:
+            view_backend = match.group(1)
+            self.path = f"/v1/{match.group(2)}"
         if not self.path.startswith("/v1/"):
             self._json(404, {"error": "only /v1/* is proxied"})
             return
@@ -359,7 +392,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 backend_name = self.server.router.backend_for(model)
             except ValueError:
-                self.server.refresh_models()
+                self.server.refresh_models(only=view_backend)
                 backend_name = self.server.router.backend_for(model)
             available, reason = self.server.lifecycle_available()
             if not available:
