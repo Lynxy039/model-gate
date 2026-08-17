@@ -127,6 +127,79 @@ class ProxyModelDiscoveryTests(unittest.TestCase):
             ],
         })
 
+    def test_refresh_models_stores_metadata_and_respects_only(self):
+        server = object.__new__(GateServer)
+        server.backends = {
+            "omlx": Backend("omlx", "http://omlx", 1, discover_models=True),
+            "ds4": Backend("ds4", "http://ds4", 1, discover_models=True),
+        }
+        server._model_refresh_lock = threading.Lock()
+        server.model_discovery_timeout = 1
+        server.router = ModelRouter({})
+        response = Mock()
+        response.read.return_value = b'{"data":[{"id":"new-model","max_model_len":262144,"created":1}]}'
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+
+        with patch("model_gate.proxy.urlopen", return_value=response) as mock_urlopen:
+            server.refresh_models(only="omlx")
+
+        self.assertEqual(server.backends["omlx"].models, ["new-model"])
+        self.assertEqual(
+            server.backends["omlx"].model_meta["new-model"],
+            {"max_model_len": 262144, "created": 1},
+        )
+        self.assertEqual(server.backends["ds4"].models, [])
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    def test_backend_view_lists_only_that_backend_with_metadata(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/omlx/v1/models"
+        handler._json = Mock()
+        handler.server = SimpleNamespace(
+            refresh_models=Mock(),
+            backends={
+                "omlx": Backend(
+                    "omlx", "http://omlx", 1, models=["coder"],
+                    model_meta={"coder": {"max_model_len": 262144}},
+                ),
+                "ds4": Backend("ds4", "http://ds4", 1, models=["flash"]),
+            },
+        )
+
+        ProxyHandler.do_GET(handler)
+
+        handler.server.refresh_models.assert_called_once_with(only="omlx")
+        handler._json.assert_called_once_with(200, {
+            "object": "list",
+            "data": [
+                {"max_model_len": 262144, "id": "coder", "object": "model", "owned_by": "omlx"},
+            ],
+        })
+
+    def test_post_backend_view_strips_prefix_before_forward(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/omlx/v1/chat/completions"
+        handler.headers = {"Content-Length": "2"}
+        handler._read_body = Mock(return_value=b'{"model":"coder"}')
+        handler._forward = Mock(return_value=200)
+        handler._json = Mock()
+        lease = Mock(initialize=False)
+        handler.server = SimpleNamespace(
+            router=SimpleNamespace(backend_for=Mock(return_value="omlx")),
+            lifecycle_available=Mock(return_value=(True, "")),
+            gate=SimpleNamespace(acquire=Mock(return_value=lease)),
+            backends={"omlx": object()},
+            refresh_models=Mock(),
+        )
+
+        ProxyHandler.do_POST(handler)
+
+        self.assertEqual(handler.path, "/v1/chat/completions")
+        handler._forward.assert_called_once_with(
+            handler.server.backends["omlx"], b'{"model":"coder"}')
+        handler._json.assert_not_called()
+
 
 class ProxyStreamingTests(unittest.TestCase):
     def test_copy_stream_reads_one_upstream_chunk_and_flushes_each_time(self):
