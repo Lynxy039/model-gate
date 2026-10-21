@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -254,8 +255,9 @@ class Poller(threading.Thread):
             "gate_stats": None, "gate_status": None, "omlx": None,
             "gate_error": "", "omlx_error": "",
             "sys": {}, "rss": {}, "cpu": None,
-            "gpu_pct": None, "gpu_watts": None, "sys_watts": None, "gpu_note": "off (--no-gpu)" if not gpu else "",
-            "hist": {k: deque(maxlen=HISTORY) for k in ("cpu", "mem", "pool", "gpu", "watts")},
+            "gpu_pct": None, "gpu_watts": None, "sys_watts": None, "gpu_temp": None,
+            "gpu_note": "off (--no-gpu)" if not gpu else "",
+            "hist": {k: deque(maxlen=HISTORY) for k in ("cpu", "mem", "pool", "gpu", "watts", "temp")},
             "rates": {"req_min": 0},
         }
         self._gpu_proc: subprocess.Popen | None = None
@@ -267,7 +269,8 @@ class Poller(threading.Thread):
             self._gpu_log = open("/tmp/mgpan-gpu.log", "w")
             self._gpu_proc = subprocess.Popen(
                 # без -n: на macOS 26 "-n 0" больше не «бесконечно», а «ноль сэмплов»
-                ["sudo", "-n", "powermetrics", "--samplers", "gpu_power,cpu_power", "-i", "1000"],
+                ["sudo", "-n", "powermetrics", "--samplers",
+                 "gpu_power,cpu_power,battery,thermal", "-i", "1000"],
                 stdout=subprocess.PIPE, stderr=self._gpu_log, text=True,
             )
         except OSError as error:
@@ -319,13 +322,7 @@ class Poller(threading.Thread):
             if line.strip():
                 continue  # копит секцию до пустой строки: Power идёт после residency
             busy_pct, watts = self._parse_gpu_sample(buffer)
-            sys_watts = self._parse_system_watts(buffer)
             buffer = ""
-            if sys_watts is not None:
-                with self.lock:
-                    if self.state.get("sys_watts") != sys_watts:
-                        self.state["hist"]["watts"].append(sys_watts)
-                    self.state["sys_watts"] = sys_watts
             if busy_pct is None:
                 continue
             with self.lock:
@@ -334,16 +331,55 @@ class Poller(threading.Thread):
                 self.state["hist"]["gpu"].append(busy_pct)
                 self.state["gpu_note"] = ""
 
-    # sampler "cpu_power" на Apple Silicon: Combined Power (CPU + GPU + ANE) — оценка пакета SoC
-    SYSTEM_WATTS_RE = re.compile(
-        r"(?:System on Board Power|Combined Power[^:]*|Package Power):\s*([\d.]+)\s*(m?W)")
-
-    @classmethod
-    def _parse_system_watts(cls, section: str) -> float | None:
-        match = cls.SYSTEM_WATTS_RE.search(section)
-        if not match:
+    # Полное питание системы powermetrics на macOS 26 не отдаёт (battery-самплер
+    # молчит), температуры — тоже. Берём из первых рук:
+    #  * ioreg AppleSmartBattery PowerTelemetryData — потребление всей машины, mW;
+    #  * macmon pipe — GPU-температура через IOReport без sudo.
+    def _read_system_watts(self) -> float | None:
+        try:
+            out = subprocess.run(["ioreg", "-rn", "AppleSmartBattery"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
             return None
-        return float(match.group(1)) * (0.001 if match.group(2) == "mW" else 1.0)
+        telemetry = re.search(r'"PowerTelemetryData" = \{([^}]*)\}', out)
+        if not telemetry:
+            return None
+        blob = telemetry.group(1)
+        match = re.search(r'"SystemPowerIn"=(-?\d+)', blob)
+        if '"ExternalConnected" = Yes' in out and match:
+            return max(0.0, int(match.group(1)) / 1000)
+        match = re.search(r'"BatteryPower"=(-?\d+)', blob)
+        if match:
+            value = int(match.group(1))
+            if value >= 2**63:  # ioreg печатает отрицательные как unsigned 2^64-x
+                value -= 2**64
+            return abs(value) / 1000
+        return None
+
+    def _pump_macmon(self) -> None:
+        binary = shutil.which("macmon")
+        if not binary:
+            return  # панель работает и без него: просто не будет бокса TEMP
+        try:
+            proc = subprocess.Popen([binary, "pipe", "-i", "1000"], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return
+        while not self._stop.is_set():
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                temp = (json.loads(line).get("temp") or {}).get("gpu_temp_avg")
+            except ValueError:
+                continue
+            if temp is None:
+                continue
+            with self.lock:
+                if self.state.get("gpu_temp") != round(temp, 1):
+                    self.state["hist"]["temp"].append(temp)
+                self.state["gpu_temp"] = round(temp, 1)
+        proc.terminate()
 
     @staticmethod
     def _parse_gpu_sample(section: str) -> tuple[float | None, float | None]:
@@ -377,6 +413,7 @@ class Poller(threading.Thread):
         if self.gpu_enabled:
             self._start_gpu()
             threading.Thread(target=self._pump_gpu, daemon=True).start()
+        threading.Thread(target=self._pump_macmon, daemon=True).start()
         cycle = 0
         while not self._stop.is_set():
             started = time.monotonic()
@@ -410,6 +447,12 @@ class Poller(threading.Thread):
             with self.lock:
                 self.state["cpu"] = cpu
                 self.state["hist"]["cpu"].append(cpu)
+            sys_watts = self._read_system_watts()
+            if sys_watts is not None:
+                with self.lock:
+                    if self.state.get("sys_watts") != sys_watts:
+                        self.state["hist"]["watts"].append(sys_watts)
+                    self.state["sys_watts"] = sys_watts
             self._update_rates()
             self._stop.wait(max(0.2, 1.1 - (time.monotonic() - started)))
             cycle += 1
@@ -550,7 +593,7 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
                        ("  peak ", "dim"), (f"{peak:.0f} W" if peak else "—", "dim"),
                        ("  gpu ", "dim"),
                        (f"{state.get('gpu_watts') or 0:.0f} W", "orange"),
-                       ("  " + spark(watts_hist, ceiling, right_width - 30), "warn")]]
+                       ("  " + spark(watts_hist, ceiling, 10), "warn")]]
         power_box = box("POWER", power_rows, right_width)
 
     # боксы правого столбца стоят вплотную друг к другу; если стек ниже лого-рамки — добор снизу
@@ -580,7 +623,9 @@ def system_section(state: dict, width: int) -> list[list[Seg]]:
     pool_frac = pool.get("model_memory_used", 0) / pool["model_memory_max"] if pool.get("model_memory_max") else None
 
     inner_width = width - 4
-    sub_width = (inner_width - 2) // 3
+    temp = state.get("gpu_temp")
+    # четвёртый подбокс — температура GPU (самплер thermal, ключи TG0*)
+    sub_width = (inner_width - 3) // (4 if temp is not None else 3)
     chart_width = sub_width - 4
 
     mem_frac = sysinfo.get("mem_frac")
@@ -607,6 +652,7 @@ def system_section(state: dict, width: int) -> list[list[Seg]]:
     subs = merge_boxes([
         sub("RAM", ram_head, hist["mem"], 1.0, mem_frac),
         sub("GPU", gpu_head, gpu_values, gpu_ceiling, gpu_fraction),
+    ] + ([sub("TEMP", f"{temp:.0f}°C", hist["temp"], 110.0, (temp or 0) / 110)] if temp is not None else []) + [
         sub("CPU", cpu_head, hist["cpu"], 100.0, None if cpu is None else cpu / 100),
     ])
     swap_used, swap_total = sysinfo.get("swap", (0, 0))
@@ -808,7 +854,8 @@ def main() -> None:
 
     if args.gpu:
         # NOPASSWD-правило в sudoers (см. README) отбывает здесь же; без него — как раньше
-        probe = subprocess.run(["sudo", "-n", "powermetrics", "--samplers", "gpu_power,cpu_power", "-i", "100", "-n", "1"],
+        probe = subprocess.run(["sudo", "-n", "powermetrics", "--samplers",
+                                "gpu_power,cpu_power,battery,thermal", "-i", "100", "-n", "1"],
                                capture_output=True, timeout=15)
         if probe.returncode != 0:
             print("Need sudo for powermetrics…")

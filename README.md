@@ -121,7 +121,7 @@ mgpan --once     # один кадр в stdout без curses — для скри
 в sudoers, тогда `--gpu` не будет спрашивать пароль:
 
 ```bash
-echo "$USER ALL=(root) NOPASSWD: /usr/bin/powermetrics --samplers gpu_power\,cpu_power -i *" | sudo tee /etc/sudoers.d/mgpan
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/powermetrics --samplers gpu_power\,cpu_power\,battery\,thermal -i *" | sudo tee /etc/sudoers.d/mgpan
 sudo chmod 440 /etc/sudoers.d/mgpan && sudo visudo -c
 ```
 
