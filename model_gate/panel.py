@@ -376,8 +376,8 @@ class Poller(threading.Thread):
             if temp is None:
                 continue
             with self.lock:
-                if self.state.get("gpu_temp") != round(temp, 1):
-                    self.state["hist"]["temp"].append(temp)
+                # пишем каждый сэмпл (не только при изменении): спарклайны всегда полные
+                self.state["hist"]["temp"].append(temp)
                 self.state["gpu_temp"] = round(temp, 1)
         proc.terminate()
 
@@ -450,8 +450,7 @@ class Poller(threading.Thread):
             sys_watts = self._read_system_watts()
             if sys_watts is not None:
                 with self.lock:
-                    if self.state.get("sys_watts") != sys_watts:
-                        self.state["hist"]["watts"].append(sys_watts)
+                    self.state["hist"]["watts"].append(sys_watts)
                     self.state["sys_watts"] = sys_watts
             self._update_rates()
             self._stop.wait(max(0.2, 1.1 - (time.monotonic() - started)))
@@ -694,13 +693,13 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
         process = backend.get("process") or {}
         cursor = sel and sel["kind"] == "backend" and sel["backend"] == name
         # имя провайдера уже в заголовке бокса — внутри только статус и pid
-        head: list[Seg] = [(f"{'▸ ' if cursor else '  '}{'●' if up else '○'} {'up' if up else 'down'}", "ok" if up else "err")]
+        head: list[Seg] = [(f"{'▸' if cursor else ''}{'●' if up else '○'} {'up' if up else 'down'}", "ok" if up else "err")]
         if process.get("pid"):
-            head.append((f"  pid {process['pid']}", "dim"))
+            head.append((f" pid {process['pid']}", "dim"))
         inner: list[list[Seg]] = [head]
         if name == "omlx" and omlx:
-            inner.append([("  prefill {} · gen {} t/s".format(omlx.get("avg_prefill_tps", "?"), omlx.get("avg_generation_tps", "?")), "orange")])
-            inner.append([("  cache {}% · up {}".format(omlx.get("cache_efficiency", "?"), fmt_g(omlx.get("uptime_seconds"))), "dim")])
+            inner.append([("prefill {} · gen {} t/s".format(omlx.get("avg_prefill_tps", "?"), omlx.get("avg_generation_tps", "?")), "orange")])
+            inner.append([("cache {}% · up {}".format(omlx.get("cache_efficiency", "?"), fmt_g(omlx.get("uptime_seconds"))), "dim")])
         else:
             extra = metrics.get(name, {})
             bits = []
@@ -711,7 +710,7 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
             if extra.get("gen_last_tps"):
                 bits.append(f"gen {extra['gen_last_tps']:.1f} t/s")
             if bits:
-                inner.append([("  " + " · ".join(bits), "orange")])
+                inner.append([(" · ".join(bits), "orange")])
             # кэш-хит и аптайм считаем по запросам гейта к этому бэкенду
             totals = [(m["prompt_tokens"], m.get("cached_tokens") or 0)
                       for key, m in stats.get("models", {}).items() if key.startswith(name + "/")]
@@ -723,8 +722,9 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
             if process.get("started_ts"):
                 tail.append(f"up {fmt_g(now - process['started_ts'])}")
             if tail:
-                inner.append([("  " + " · ".join(tail), "dim")])
-        inner.append([("", "")])
+                inner.append([(" · ".join(tail), "dim")])
+        if not vertical:  # в узком режиме пустая строка между статусом и списком не нужна
+            inner.append([("", "")])
         for model in backend.get("models", []):
             selected = sel and sel["kind"] == "model" and sel["backend"] == name and sel["id"] == model["id"]
             if model.get("active"):
@@ -735,10 +735,10 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
                 role, mark = "dim", "·"
             if selected:
                 role, mark = "live", "▸"
-            inner.append([(f" {mark} {model['id'][:sub_width - 6]}", role)])
+            inner.append([(f"{mark} {model['id'][:sub_width - 5]}", role)])
         groups.append((name, inner))
     if not groups:
-        return box("BACKENDS", [[(" no data from gate", "warn")]], width)
+        return box("BACKENDS", [[("no data from gate", "warn")]], width)
     if vertical:
         lines: list[list[Seg]] = []
         for name, inner in groups:
@@ -755,24 +755,24 @@ def models_section(state: dict, width: int, compact: bool = False) -> list[list[
     models = stats.get("models", {})
     inner: list[list[Seg]] = []
     if not models:
-        inner.append([(" no traffic yet", "dim")])
+        inner.append([("no traffic yet", "dim")])
     elif compact:
         # узкий режим: только главные колонки, модель во всю оставшуюся ширину
-        name_w = max(6, width - 4 - 23)
-        inner.append([(f" {'model':<{name_w}}", "dim"), (f"{'req':>5}", "dim"),
+        name_w = max(6, width - 4 - 22)
+        inner.append([(f"{'model':<{name_w}}", "dim"), (f"{'req':>5}", "dim"),
                       (f"{'in':>6}", "dim"), (f"{'out':>6}", "dim"), (f"{'t/s':>5}", "dim")])
         for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
             model = models[key]
             avg_tps = model.get("avg_tps")
             short = key.replace("ds4/", "d:").replace("omlx/", "o:")
             role = "ok" if model["errors"] == 0 else "warn"
-            inner.append([(f" {short[:name_w]:<{name_w}}", role),
+            inner.append([(f"{short[:name_w]:<{name_w}}", role),
                           (f"{model['requests']:>5}", "fg"),
                           (f"{fmt_n(model['prompt_tokens']):>6}", "fg"),
                           (f"{fmt_n(model['completion_tokens']):>6}", "fg"),
                           (f"{(f'{avg_tps:.0f}' if avg_tps else '—'):>5}", "orange")])
     else:
-        inner.append([(" model" + " " * 29, "dim"), (f"{'req':>5}", "dim"), (f"{'in':>7}", "dim"),
+        inner.append([("model" + " " * 29, "dim"), (f"{'req':>5}", "dim"), (f"{'in':>7}", "dim"),
                       (f"{'out':>7}", "dim"), (f"{'cache':>6}", "dim"), (f"{'pre t/s':>8}", "dim"),
                       (f"{'gen t/s':>8}", "dim"), (f"{'last':>7}", "dim")])
         for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
@@ -783,7 +783,7 @@ def models_section(state: dict, width: int, compact: bool = False) -> list[list[
             prefill = model.get("last_prefill_tps")
             short = key.replace("ds4/", "d:").replace("omlx/", "o:")
             role = "ok" if model["errors"] == 0 else "warn"
-            inner.append([(f" {short[:30]:<34}", role),
+            inner.append([(f"{short[:30]:<34}", role),
                           (f"{model['requests']:>5}", "fg"),
                           (f"{fmt_n(model['prompt_tokens']):>7}", "fg"),
                           (f"{fmt_n(model['completion_tokens']):>7}", "fg"),
@@ -799,32 +799,36 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
     recent = state.get("_recent_view", stats.get("recent", []))[:limit]
     inner: list[list[Seg]] = []
     if not recent:
-        inner.append([(" no traffic yet", "dim")])
+        inner.append([("no traffic yet", "dim")])
         return box("RECENT" if compact else "RECENT REQUESTS  (PgUp/PgDn)", inner, width)
     if compact:
-        name_w = max(6, width - 4 - 28)
-        inner.append([(f" {'hh:mm':<5}", "dim"), (f" {'model':<{name_w}}", "dim"),
-                      (f"{'ok':>4}", "dim"), (f"{'dur':>6}", "dim"),
-                      (f"{'out':>6}", "blue"), (f"{'t/s':>5}", "orange")])
+        # без колонки статуса: имя модели зелёное при 200, красное при ошибке
+        name_w = max(6, width - 4 - 29)
+        inner.append([(f"{'hh:mm':<6}", "dim"), (f"{'model':<{name_w}}", "dim"),
+                      (f"{'dur':>6}", "dim"), (f"{'out':>6}", "blue"),
+                      (f"{'t/s':>5}", "orange"), (f"{'pre':>6}", "orange")])
         for record in recent:
             stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M")
             if record.get("disconnected"):
-                flag, role = "ABRT", "warn"
+                role = "warn"
             elif record["status"] >= 400:
-                flag, role = str(record["status"]), "err"
+                role = "err"
             else:
-                flag, role = "200", "ok"
+                role = "ok"
             tps = f"{record['tps']:.0f}" if record.get("tps") else "—"
-            inner.append([(f" {stamp:<5}", "dim"),
-                          (f" {record['model'][:name_w]:<{name_w}}", "fg"),
-                          (f"{flag:>4}", role),
+            prefill = f"{record['prefill_tps']:.0f}" if record.get("prefill_tps") else "—"
+            inner.append([(f"{stamp:<6}", "dim"),
+                          (f"{record['model'][:name_w]:<{name_w}}", role),
                           (f"{record['elapsed_s']:>5.0f}s", "fg"),
                           (f"{fmt_n(record['completion_tokens']):>6}", "blue"),
-                          (f"{tps:>5}", "orange")])
+                          (f"{tps:>5}", "orange"),
+                          (f"{prefill:>6}", "orange")])
+        while len(inner) < limit + 1:  # добиваем пустыми строками — бокс до футера
+            inner.append([("", "")])
         return box("RECENT", inner, width)
     # колонки: каждая своим цветом — время тусклое, модель обычная, статус
     # по результату, токены синие, кэш розовый, скорости оранжевые
-    inner.append([(f" {'time':<8}", "dim"), (f" {'model':<24}", "dim"), (" " + f"{'code':>4}", "dim"),
+    inner.append([(f"{'time':<9}", "dim"), (f" {'model':<24}", "dim"), (" " + f"{'code':>4}", "dim"),
                   (" " + f"{'dur':>7}", "dim"), (f" {'in':>7}", "blue"), (f" {'out':>6}", "blue"),
                   (f" {'cache':>6}", "live"), (" " + f"{'gen t/s':>8}", "orange"), (f" {'pre t/s':>8}", "orange")])
     for record in recent:
@@ -839,7 +843,7 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
         prefill = f"{record['prefill_tps']:.0f}" if record.get("prefill_tps") else "—"
         prompt, cached = record.get("prompt_tokens") or 0, record.get("cached_tokens") or 0
         reuse = f"{100 * cached / prompt:.0f}%" if prompt and cached else "—"
-        inner.append([(" " + f"{stamp:<8}", "dim"),
+        inner.append([(f"{stamp:<9}", "dim"),
                       (f" {record['model'][:24]:<24}", "fg"),
                       (f"{flag:>5}", role),
                       (f" {record['elapsed_s']:>6.2f}s", "fg"),
@@ -848,6 +852,8 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
                       (f" {reuse:>6}", "live"),
                       (f" {tps:>8}", "orange"),
                       (f" {prefill:>8}", "orange")])
+    while len(inner) < limit + 1:  # добиваем пустыми строками — бокс до футера
+        inner.append([("", "")])
     return box("RECENT REQUESTS  (PgUp/PgDn)", inner, width)
 
 
@@ -944,7 +950,7 @@ def compact_system_section(state: dict, width: int) -> list[list[Seg]]:
     if watts is not None:
         rows.append([("pwr ", "dim"), (f"{watts:>3.0f}W ", "fg"), (spark(hist["watts"], 150.0, n), "warn")])
     if not rows:
-        rows = [[(" no data", "dim")]]
+        rows = [[("no data", "dim")]]
     return box("SYSTEM", rows, width)
 
 
@@ -956,7 +962,7 @@ def render(state: dict, width: int, height: int, sel: dict | None = None,
         lines += backends_section(state, width, sel, vertical=True)
         lines += models_section(state, width, compact=True)
         fixed = len(lines)
-        limit = max(1, min(10, height - fixed - 2))
+        limit = max(1, height - fixed - 4)  # RECENT растягивается до самого футера
         lines += recent_section(state, width, limit, compact=True)
         return lines
     lines = header_section(state, width, sel)
@@ -964,7 +970,7 @@ def render(state: dict, width: int, height: int, sel: dict | None = None,
     lines += backends_section(state, width, sel)
     lines += models_section(state, width)
     fixed = len(lines)
-    limit = max(1, min(12, height - fixed - 2))
+    limit = max(1, height - fixed - 4)  # RECENT растягивается до самого футера
     lines += recent_section(state, width, limit)
     return lines
 
@@ -1070,6 +1076,9 @@ def main() -> None:
                 paused = not paused
             if key == ord("c"):
                 compact = not compact
+            if key == curses.KEY_RESIZE and not args.compact:
+                # терминал поменяли — режим пересчитывается по новой ширине
+                compact = screen.getmaxyx()[1] < 80
             with poller.lock:
                 state = dict(poller.state)
                 recent = list((state.get("gate_stats") or {}).get("recent", []))
