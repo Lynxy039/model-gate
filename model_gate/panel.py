@@ -1,4 +1,4 @@
-"""mgpan — цветная TUI-панель мониторинга model-gate (curses, без зависимостей).
+"""mgpan — цветная TUI-панель мониторинга model-gate (raw ANSI, без зависимостей).
 
 Gruvbox, логотип lynxy-dev, боксы: header+LIVE, SYSTEM (подбоксы RAM|GPU|CPU
 с многоуровневыми графиками), BACKENDS (модели и метрики провайдеров),
@@ -9,17 +9,21 @@ omlx /admin/api/stats, vm_stat/top/sysctl, опционально sudo powermetr
 from __future__ import annotations
 
 import argparse
-import curses
+import fcntl
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -30,19 +34,25 @@ EIGHTHS = " ▁▂▃▄▅▆▇█"
 HISTORY = 150
 CHART_ROWS = 4
 
-GRUVBOX_256 = {
-    "ok": 142, "err": 167, "warn": 214, "head": 108, "live": 175,
-    "dim": 245, "blue": 109, "orange": 208, "fg": 223,
-    # рамка в цвет border-палитры темы lynxy-dev (gruvbox bg3 #665c54), как футер Pi
-    "border": 240,
-}
-GRUVBOX_16 = {
-    "ok": curses.COLOR_GREEN, "err": curses.COLOR_RED, "warn": curses.COLOR_YELLOW,
-    "head": curses.COLOR_CYAN, "live": curses.COLOR_MAGENTA, "dim": curses.COLOR_WHITE,
-    "blue": curses.COLOR_BLUE, "orange": curses.COLOR_YELLOW, "fg": curses.COLOR_WHITE,
-    "border": curses.COLOR_WHITE,
+GRUVBOX_RGB = {
+    # палитра темы lynxy-dev (gruvbox material) — цвета один в один с Pi
+    "fg":     (0xEB, 0xDB, 0xB2),   # fg1
+    "dim":    (0x92, 0x83, 0x74),   # gray
+    "border": (0x66, 0x5C, 0x54),   # bg3 — рамки как в футере Pi
+    "ok":     (0xB8, 0xBB, 0x26),   # green
+    "err":    (0xFB, 0x49, 0x34),   # red
+    "warn":   (0xFE, 0x80, 0x19),   # orange
+    "orange": (0xFA, 0xBD, 0x2F),   # yellow — скорости
+    "head":   (0x8E, 0xC0, 0x7C),   # aqua
+    "live":   (0xD3, 0x86, 0x9B),   # purple
+    "blue":   (0x83, 0xA5, 0x98),   # blue
 }
 BOLD_ROLES = ("head", "live")
+# truecolor SGR: ncurses на macOS truecolor не умеет (нет setrgb в terminfo),
+# поэтому рендер — raw ANSI, как у Pi; цвета не зависят от палитры терминала
+SGR: dict[str, str] = {"": "\x1b[0m"}
+SGR.update({role: ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g};{b}m"
+            for role, (r, g, b) in GRUVBOX_RGB.items()})
 
 LOGO = [
     ("██╗     ", "ok", "██╗  ██╗", "blue"),
@@ -978,24 +988,64 @@ def render(state: dict, width: int, height: int, sel: dict | None = None,
     return lines
 
 
-def draw(screen, state: dict, colors: dict, sel: dict | None = None,
+class Tty:
+    """Raw-ANSI рендер: alt-screen, truecolor, сырой ввод — как у Pi, без ncurses."""
+
+    def __enter__(self) -> "Tty":
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        sys.stdout.flush()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def size(self) -> tuple[int, int]:
+        try:
+            rows, cols = struct.unpack("HH", fcntl.ioctl(self.fd, termios.TIOCGWINSZ, b"\x00" * 8)[:4])
+            return int(rows), int(cols)
+        except OSError:
+            fallback = shutil.get_terminal_size()
+            return fallback.lines, fallback.columns
+
+    def paint(self, lines: list[list[Seg]], footer: str, footer_bold: bool = False) -> None:
+        buf = ["\x1b[H"]
+        prev = None
+        for segs in lines:
+            for text, role in segs:
+                sgr = SGR.get(role, "")
+                if sgr != prev:
+                    buf.append(sgr)
+                    prev = sgr
+                buf.append(text)
+            buf.append("\x1b[0m\x1b[K\r\n")
+            prev = None
+        buf.append("\x1b[7m" + ("\x1b[1m" if footer_bold else "") + footer + "\x1b[0m\x1b[K\x1b[J")
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+
+    def key(self, timeout: float) -> str | None:
+        if not select.select([sys.stdin], [], [], timeout)[0]:
+            return None
+        data = os.read(self.fd, 16)
+        if data.startswith(b"\x1b["):
+            return {"A": "UP", "B": "DOWN", "5~": "PgUp", "6~": "PgDn"}.get(data[2:].decode("ascii", "ignore"))
+        if data == b"\x1b":
+            return "ESC"
+        return chr(data[0]) if data else None
+
+
+def draw(tty_: Tty, state: dict, sel: dict | None = None,
          actions: "Actions | None" = None, pending: tuple | None = None,
          compact: bool = False) -> None:
-    height, width = screen.getmaxyx()
-    screen.erase()
-    for y, segs in enumerate(render(state, width - 1, height, sel, compact)[:height - 1]):
-        x = 0
-        for text, role in segs:
-            if x >= width - 1:
-                break
-            try:
-                screen.addnstr(y, x, text, width - 1 - x, colors.get(role, 0))
-            except curses.error:
-                pass
-            x += len(text)
+    height, width = tty_.size()
+    lines = render(state, width - 1, height, sel, compact)[:height - 1]
     if pending:
         footer = f" {pending[1]}  [y/N] "
-        attr = colors.get("err", 0) | curses.A_REVERSE
     else:
         status = actions.status() if actions else ""
         hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
@@ -1003,12 +1053,7 @@ def draw(screen, state: dict, colors: dict, sel: dict | None = None,
             footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p jk PgUp c{hint}"
         else:
             footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · j/k select · PgUp/PgDn log{hint}"
-        attr = curses.A_REVERSE
-    try:
-        screen.addnstr(height - 1, 0, footer, width - 1, attr)
-    except curses.error:
-        pass
-    screen.refresh()
+    tty_.paint(lines, footer[:width - 1], footer_bold=bool(pending))
 
 
 def flatten(segs: list[Seg]) -> str:
@@ -1023,14 +1068,8 @@ def main() -> None:
                         help="real GPU%% via sudo powermetrics (по умолчанию вкл; --no-gpu выключает)")
     parser.add_argument("--compact", action="store_true",
                         help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
-    parser.add_argument("--once", action="store_true", help="single frame to stdout, no curses")
+    parser.add_argument("--once", action="store_true", help="single frame to stdout, no TUI")
     args = parser.parse_args()
-
-    # ncurses в xterm-ghostty сжимает длинные повторы (━━━━, ████) в rep-секвенции,
-    # а Ghostty их не отрисовывает — горизонтальные рамки исчезают. В xterm-256color
-    # rep нет; остальное Ghostty понимает идентично.
-    if "ghostty" in os.environ.get("TERM", ""):
-        os.environ["TERM"] = "xterm-256color"
 
     if args.gpu:
         # NOPASSWD-правило в sudoers (см. README) отбывает здесь же; без него — как раньше
@@ -1057,37 +1096,26 @@ def main() -> None:
         poller.stop()
         return
 
-    def wrapper(screen):
-        curses.curs_set(0)
-        screen.nodelay(True)
-        colors: dict[str, int] = {}
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-            palette = GRUVBOX_256 if curses.COLORS >= 256 else GRUVBOX_16
-            for role, color in palette.items():
-                if role == "fg":
-                    continue
-                index = list(palette).index(role) + 1
-                curses.init_pair(index, color, -1)
-                colors[role] = curses.color_pair(index) | (curses.A_BOLD if role in BOLD_ROLES else 0)
+    actions = Actions(args.url, args.omlx_url)
+    paused, scroll, sel_index, pending, restart = False, 0, 0, None, False
+    with Tty() as tty_:
+        compact = args.compact or tty_.size()[1] < 80
+        prev_width = tty_.size()[1]
         poller.start()
-        actions = Actions(args.url, args.omlx_url)
-        paused, scroll, sel_index, pending = False, 0, 0, None
-        # узкий режим: флаг, авто по ширине терминала, или клавиша c на лету
-        compact = args.compact or screen.getmaxyx()[1] < 80
         while True:
-            screen.timeout(500)
-            key = screen.getch()
-            if key in (ord("q"), 27):
+            key = tty_.key(0.5)
+            _, width = tty_.size()
+            if width != prev_width:
+                prev_width = width
+                if not args.compact:
+                    # терминал поменяли — режим пересчитывается по новой ширине
+                    compact = width < 80
+            if key in ("q", "ESC"):
                 break
-            if key == ord("p"):
+            if key == "p":
                 paused = not paused
-            if key == ord("c"):
+            if key == "c":
                 compact = not compact
-            if key == curses.KEY_RESIZE and not args.compact:
-                # терминал поменяли — режим пересчитывается по новой ширине
-                compact = screen.getmaxyx()[1] < 80
             with poller.lock:
                 state = dict(poller.state)
                 recent = list((state.get("gate_stats") or {}).get("recent", []))
@@ -1102,49 +1130,49 @@ def main() -> None:
                 return []
 
             if pending:
-                if key == ord("y"):
+                if key == "y":
                     pending[0]()
                 pending = None
-            elif key == ord("s") and sel and "s" in sel["keys"]:
+            elif key == "s" and sel and "s" in sel["keys"]:
                 backend = sel["backend"]
                 pending = (lambda b=backend: actions.stop(b), f"STOP backend {backend} (освободит RAM)")
-            elif key == ord("w") and sel and "w" in sel["keys"]:
+            elif key == "w" and sel and "w" in sel["keys"]:
                 actions.warm(sel["id"])
-            elif key == ord("r") and sel and "r" in sel["keys"]:
+            elif key == "r" and sel and "r" in sel["keys"]:
                 backend = sel["backend"]
                 models = backend_models(backend)
                 warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")), None)
                 pending = (lambda b=backend, m=warm_model: actions.restart(b, m), f"RESTART backend {backend}")
-            elif key == ord("x") and sel and "x" in sel["keys"]:
+            elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
-            elif key == ord("u") and sel and "u" in sel["keys"]:
+            elif key == "u" and sel and "u" in sel["keys"]:
                 api_key = (state.get("omlx") or {}).get("api_key", "")
                 model_id = sel["id"]
                 pending = (lambda m=model_id, k=api_key: actions.omlx_unload(m, k), f"UNLOAD omlx model {model_id[:34]}")
-            elif key == ord("o") and sel and "o" in sel["keys"]:
+            elif key == "o" and sel and "o" in sel["keys"]:
                 cli = (state.get("omlx") or {}).get("cli_prefix") or "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
                 pending = (lambda c=cli: actions.omlx_restart(c), "RESTART omlx SERVER (сбросит все модели)")
-            elif key == ord("Q"):
+            elif key == "Q":
                 pending = (actions.stop_gate, "STOP model-gate (все ds4-серверы умрут)")
-            elif key == ord("R"):
-                # рестарт только панели (свежий код/палитра), gate не трогать
-                poller.stop()
-                curses.endwin()
-                os.execv(sys.executable, [sys.executable, sys.argv[0], *sys.argv[1:]])
-            if key == curses.KEY_NPAGE:
+            elif key == "R":
+                restart = True
+                break
+            if key == "PgUp":
                 scroll += 5
-            elif key == curses.KEY_PPAGE:
+            elif key == "PgDn":
                 scroll = max(0, scroll - 5)
-            elif key in (curses.KEY_DOWN, ord("j")):
+            elif key in ("DOWN", "j"):
                 sel_index = min(sel_index + 1, max(0, len(targets) - 1))
-            elif key in (curses.KEY_UP, ord("k")):
+            elif key in ("UP", "k"):
                 sel_index = max(0, sel_index - 1)
             if not paused:
                 state["_recent_view"] = recent[scroll:]
-                draw(screen, state, colors, sel, actions, pending, compact)
+                draw(tty_, state, sel, actions, pending, compact)
         poller.stop()
 
-    curses.wrapper(wrapper)
+    if restart:
+        # рестарт только панели (свежий код/палитра), gate не трогать
+        os.execv(sys.executable, [sys.executable, sys.argv[0], *sys.argv[1:]])
 
 
 if __name__ == "__main__":
