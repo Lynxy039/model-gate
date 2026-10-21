@@ -167,3 +167,16 @@ python3.11 -m unittest discover -v
 нужно подобрать измерением; они являются страховочной паузой, а не подтверждением
 состояния. Для строгого режима lifecycle endpoint должен возвращаться только после
 завершения операции, а proxy в будущем можно дополнить memory/readiness probe.
+
+### Плагин herdr
+
+`herdr-plugin/` — официальный плагин herdr (манифест `herdr-plugin.toml`):
+pane «model-gate» открывает mgpan в split-панели (mgrun поднимет gate при
+необходимости), экшен «Open model-gate panel» — то же из меню действий.
+
+```bash
+herdr plugin link ~/Projects/model-gate/herdr-plugin   # однократно
+herdr plugin pane open --plugin lynxy.model-gate --entrypoint mgpan
+```
+
+Узкий pane — панель автоматически переходит в компактный режим.

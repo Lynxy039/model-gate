@@ -1,0 +1,22 @@
+id = "lynxy.model-gate"
+name = "model-gate"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Панель мониторинга model-gate (mgpan) в pane herdr: LIVE-запросы, бэкенды, графики, управление."
+platforms = ["macos", "linux"]
+
+# pane открывает mgrun: поднимет gate, если не поднят, и покажет панель.
+# Узкий pane — панель сама перейдёт в компактный режим (ширина <80).
+[[panes]]
+id = "mgpan"
+title = "model-gate"
+placement = "split"
+command = ["./mgpan-pane.sh"]
+
+# быстрый вызов из меню действий, если сплит не нужен надолго
+[[actions]]
+id = "open"
+title = "Open model-gate panel"
+description = "Открыть mgpan в split-панели (gate поднимется при необходимости)."
+contexts = ["workspace"]
+command = ["./open-pane.sh"]
