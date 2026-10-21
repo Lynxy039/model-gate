@@ -33,11 +33,14 @@ CHART_ROWS = 4
 GRUVBOX_256 = {
     "ok": 142, "err": 167, "warn": 214, "head": 108, "live": 175,
     "dim": 245, "blue": 109, "orange": 208, "fg": 223,
+    # рамка в цвет border-палитры темы lynxy-dev (gruvbox bg3 #665c54), как футер Pi
+    "border": 240,
 }
 GRUVBOX_16 = {
     "ok": curses.COLOR_GREEN, "err": curses.COLOR_RED, "warn": curses.COLOR_YELLOW,
     "head": curses.COLOR_CYAN, "live": curses.COLOR_MAGENTA, "dim": curses.COLOR_WHITE,
     "blue": curses.COLOR_BLUE, "orange": curses.COLOR_YELLOW, "fg": curses.COLOR_WHITE,
+    "border": curses.COLOR_WHITE,
 }
 BOLD_ROLES = ("head", "live")
 
@@ -474,8 +477,8 @@ class Poller(threading.Thread):
 def box(title: str, inner: list[list[Seg]], width: int) -> list[list[Seg]]:
     inner_width = width - 4
     title = title[:max(0, width - 6)]  # заголовок не должен разрывать рамку
-    lines: list[list[Seg]] = [[("┌─ ", "dim"), (title, "head"),
-                               (" " + "─" * max(0, width - len(title) - 5), "dim"), ("┐", "dim")]]
+    lines: list[list[Seg]] = [[("╭─ ", "border"), (title, "head"),
+                               (" " + "─" * max(0, width - len(title) - 5), "border"), ("╮", "border")]]
     for segs in inner:
         used = sum(len(text) for text, _ in segs)
         if used > inner_width:  # узкий терминал: режем строку, а не ломаем сетку
@@ -489,8 +492,8 @@ def box(title: str, inner: list[list[Seg]], width: int) -> list[list[Seg]]:
             segs = clipped
             used = inner_width
         pad = max(0, inner_width - used)
-        lines.append([("│ ", "dim")] + segs + [(" " * pad, "dim"), (" │", "dim")])
-    lines.append([("└" + "─" * (width - 2) + "┘", "dim")])
+        lines.append([("│ ", "border")] + segs + [(" " * pad, "border"), (" │", "border")])
+    lines.append([("╰" + "─" * (width - 2) + "╯", "border")])
     return lines
 
 
@@ -611,11 +614,11 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
     height = max(3 + len(stack), len(logo_inner) + 2)
     right += stack + [[("", "")]] * max(0, height - 3 - len(stack))
     logo_inner += [[]] * (height - 2 - len(logo_inner))
-    logo_box: list[list[Seg]] = [[("┌" + "─" * (LOGO_WIDTH + 2) + "┐", "dim")]]
+    logo_box: list[list[Seg]] = [[("╭" + "─" * (LOGO_WIDTH + 2) + "╮", "border")]]
     for segs in logo_inner:
         used = sum(len(text) for text, _ in segs)
-        logo_box.append([("│ ", "dim")] + segs + [(" " * (LOGO_WIDTH - used), "dim"), (" │", "dim")])
-    logo_box.append([("└" + "─" * (LOGO_WIDTH + 2) + "┘", "dim")])
+        logo_box.append([("│ ", "border")] + segs + [(" " * (LOGO_WIDTH - used), "border"), (" │", "border")])
+    logo_box.append([("╰" + "─" * (LOGO_WIDTH + 2) + "╯", "border")])
 
     lines: list[list[Seg]] = []
     for row in range(height):
@@ -1022,6 +1025,12 @@ def main() -> None:
                         help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
     parser.add_argument("--once", action="store_true", help="single frame to stdout, no curses")
     args = parser.parse_args()
+
+    # ncurses в xterm-ghostty сжимает длинные повторы (━━━━, ████) в rep-секвенции,
+    # а Ghostty их не отрисовывает — горизонтальные рамки исчезают. В xterm-256color
+    # rep нет; остальное Ghostty понимает идентично.
+    if "ghostty" in os.environ.get("TERM", ""):
+        os.environ["TERM"] = "xterm-256color"
 
     if args.gpu:
         # NOPASSWD-правило в sudoers (см. README) отбывает здесь же; без него — как раньше
