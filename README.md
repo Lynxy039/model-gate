@@ -168,22 +168,3 @@ python3.11 -m unittest discover -v
 состояния. Для строгого режима lifecycle endpoint должен возвращаться только после
 завершения операции, а proxy в будущем можно дополнить memory/readiness probe.
 
-### Плагин herdr: панель-сайдбар
-
-`herdr-plugin/` — официальный плагин herdr. mgpan развешен по **всем
-workspace** и ведёт себя как сайдбар: startup hook развешивает панели после
-старта сервера, событие `workspace.created` цепляет панель на новый
-workspace, `prefix+g` (или экшен «Toggle model-gate panel») открыть/закрыть
-панель в текущем workspace. Экземпляры лёгкие: `--no-gpu` (powermetrics
-восемь раз параллельно — слишком дорого), узкий pane — авто-компакт.
-
-```bash
-herdr plugin link ~/Projects/model-gate/herdr-plugin   # однократно
-# дальше: prefix+g в herdr, либо вручную:
-herdr plugin pane open --plugin lynxy.model-gate --entrypoint mgpan \
-    --target-pane <pane> --direction right
-```
-
-Нюанс herdr 0.9.5: `plugin.pane.open` с `placement=split` принимает
-`target_pane_id` **без** `workspace_id` (вместе — ошибка валидации);
-workspace берётся из целевого pane.
