@@ -7,6 +7,8 @@ from urllib.error import URLError
 from model_gate.gate import AdmissionGate, AdmissionPolicy
 from model_gate.proxy import Backend, GateServer, Lifecycle, LifecycleError, ProcessManager, ProxyHandler
 from model_gate.router import ModelRouter
+from model_gate.stats import StatsCollector
+from model_gate.tui import model_rows
 
 
 class AdmissionGateTests(unittest.TestCase):
@@ -191,14 +193,35 @@ class ProxyModelDiscoveryTests(unittest.TestCase):
             gate=SimpleNamespace(acquire=Mock(return_value=lease)),
             backends={"omlx": object()},
             refresh_models=Mock(),
+            stats=StatsCollector(),
+            active_requests={}, _active_lock=threading.Lock(),
         )
 
         ProxyHandler.do_POST(handler)
 
         self.assertEqual(handler.path, "/v1/chat/completions")
-        handler._forward.assert_called_once_with(
-            handler.server.backends["omlx"], b'{"model":"coder"}')
+        args = handler._forward.call_args.args
+        self.assertIs(args[0], handler.server.backends["omlx"])
+        self.assertEqual(args[1], b'{"model":"coder"}')
         handler._json.assert_not_called()
+
+
+class ProxyAdminTests(unittest.TestCase):
+    def test_stop_endpoint_stops_local_backend(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/admin/stop"
+        handler.client_address = ("127.0.0.1", 1234)
+        handler._read_body = Mock(return_value=b'{"backend":"ds4"}')
+        handler._json = Mock()
+        handler.server = SimpleNamespace(
+            backends={"ds4": object()},
+            processes=SimpleNamespace(stop=Mock(return_value=True)),
+        )
+
+        ProxyHandler.do_POST(handler)
+
+        handler.server.processes.stop.assert_called_once_with("ds4")
+        handler._json.assert_called_once_with(200, {"ok": True, "backend": "ds4"})
 
 
 class ProxyStreamingTests(unittest.TestCase):
@@ -230,12 +253,17 @@ class ProxyStreamingTests(unittest.TestCase):
             lifecycle_available=Mock(return_value=(True, "")),
             gate=SimpleNamespace(acquire=Mock(return_value=lease)),
             backends={"ds4": object()},
+            stats=StatsCollector(),
+            active_requests={}, _active_lock=threading.Lock(),
         )
 
         ProxyHandler.do_POST(handler)
 
         handler._json.assert_not_called()
         lease.release.assert_called_once_with()
+        snapshot = handler.server.stats.snapshot()
+        self.assertEqual(snapshot["models"]["ds4/flash"]["disconnected"], 1)
+        self.assertEqual(snapshot["inflight"], [])
 
 
 class ProcessManagerTests(unittest.TestCase):
@@ -264,7 +292,55 @@ class ProcessManagerTests(unittest.TestCase):
             start_new_session=True,
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
+            text=True,
+            bufsize=1,
         )
+
+    def test_status_reports_and_stops_managed_backend(self):
+        backend = Backend("ds4", "http://ds4", 1)
+        manager = ProcessManager({"ds4": backend})
+        process = Mock()
+        process.poll.return_value = None
+        process.pid = 1234
+        manager._processes["ds4"] = process
+        manager._commands["ds4"] = ["ds4-server", "-m", "flash.gguf"]
+        manager._models["ds4"] = "flash"
+
+        self.assertEqual(manager.snapshot(), {
+            "ds4": {"running": True, "pid": 1234, "model": "flash", "started_ts": None},
+        })
+        self.assertTrue(manager.stop("ds4"))
+        process.terminate.assert_called_once_with()
+        self.assertEqual(manager.snapshot(), {})
+
+    def test_autostart_restarts_backend_when_model_command_changes(self):
+        commands = {
+            "ds4-0731": ["ds4-server", "-m", "flash.gguf"],
+            "ds4-vision": ["ds4-server", "-m", "vision.gguf", "--vision", "encoder.gguf"],
+        }
+        backend = Backend(
+            "ds4", "http://ds4", 1,
+            model_commands=commands,
+            startup_timeout=1,
+            startup_poll_seconds=0,
+        )
+        manager = ProcessManager({"ds4": backend})
+        first = Mock()
+        second = Mock()
+        first.poll.return_value = None
+        second.poll.return_value = None
+        response = Mock()
+        response.status = 200
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+
+        with patch("model_gate.proxy.subprocess.Popen", side_effect=[first, second]) as popen:
+            with patch("model_gate.proxy.urlopen", side_effect=[URLError("down"), response, response]):
+                manager.ensure_ready("ds4", "ds4-0731")
+                manager.ensure_ready("ds4", "ds4-vision")
+
+        first.terminate.assert_called_once_with()
+        self.assertEqual([call.args[0] for call in popen.call_args_list], list(commands.values()))
 
 
 class LifecycleTests(unittest.TestCase):
@@ -312,6 +388,7 @@ class LifecycleTests(unittest.TestCase):
         lifecycle = Lifecycle(backends)
         calls = []
         lifecycle._post = calls.append
+        lifecycle._is_loaded = lambda *_: True
 
         lifecycle.activate("omlx", "coder", "light")
         lifecycle.activate("omlx", "heavy-122b", None)
@@ -345,6 +422,28 @@ class LifecycleTests(unittest.TestCase):
         lifecycle.activate("omlx", "coder", "light")
 
         self.assertEqual(calls, ["http://omlx/load/coder"])
+
+
+class TuiTests(unittest.TestCase):
+    def test_rows_expose_running_model_and_backend(self):
+        status = {
+            "backends": [{
+                "name": "ds4",
+                "ready": True,
+                "process": {"pid": 1234, "model": "glm5.3-flash"},
+                "models": [
+                    {"id": "ds4-0731", "active": 0, "loaded": False, "running": False},
+                    {"id": "glm5.3-flash", "active": 1, "loaded": True, "running": True},
+                ],
+            }],
+        }
+
+        self.assertEqual(model_rows(status), [
+            ("ds4", {"pid": 1234, "model": "glm5.3-flash"}, True,
+             {"id": "ds4-0731", "active": 0, "loaded": False, "running": False}),
+            ("ds4", {"pid": 1234, "model": "glm5.3-flash"}, True,
+             {"id": "glm5.3-flash", "active": 1, "loaded": True, "running": True}),
+        ])
 
 
 class ModelRouterTests(unittest.TestCase):

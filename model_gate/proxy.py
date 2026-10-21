@@ -8,7 +8,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
 from pathlib import Path
 import re
+import signal
+import socket
 import subprocess
+import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
@@ -17,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from .gate import AdmissionGate, AdmissionPolicy
 from .router import ModelRouter
+from .stats import InFlight, StatsCollector
 
 
 LOGGER = logging.getLogger(__name__)
@@ -41,6 +45,7 @@ class Backend:
     base_url: str
     max_concurrency: int
     model_policies: dict[str, dict] = field(default_factory=dict)
+    model_commands: dict[str, list[str]] = field(default_factory=dict)
     models: list[str] = field(default_factory=list)
     model_meta: dict[str, dict] = field(default_factory=dict)
     prefixes: list[str] = field(default_factory=list)
@@ -59,6 +64,7 @@ class Backend:
     startup_timeout: float = 120
     startup_poll_seconds: float = 1
     stop_on_proxy_exit: bool = True
+    inject_stream_usage: bool = True
 
     @classmethod
     def from_config(cls, name: str, config: dict) -> "Backend":
@@ -67,6 +73,7 @@ class Backend:
             base_url=config["base_url"].rstrip("/"),
             max_concurrency=int(config.get("max_concurrency", 1)),
             model_policies=dict(config.get("model_policies", {})),
+            model_commands={model: list(command) for model, command in config.get("model_commands", {}).items()},
             models=list(config.get("models", [])),
             prefixes=list(config.get("prefixes", [])),
             discover_models=bool(config.get("discover_models", False)),
@@ -84,10 +91,14 @@ class Backend:
             startup_timeout=float(config.get("startup_timeout", 120)),
             startup_poll_seconds=float(config.get("startup_poll_seconds", 1)),
             stop_on_proxy_exit=bool(config.get("stop_on_proxy_exit", True)),
+            inject_stream_usage=bool(config.get("inject_stream_usage", True)),
         )
 
     def admin_url(self, template: str, model: str | None = None) -> str:
         return template.replace("{model}", quote(model or "", safe=""))
+
+    def command_for(self, model: str) -> list[str] | None:
+        return self.model_commands.get(model, self.autostart_command)
 
     def admission_policy(self, model: str) -> AdmissionPolicy:
         config = self.model_policies.get(model, {})
@@ -104,36 +115,76 @@ class LifecycleError(RuntimeError):
 class ProcessManager:
     """Starts optional backend servers and waits for their readiness endpoint."""
 
-    def __init__(self, backends: dict[str, Backend], timeout: float = 5):
+    def __init__(self, backends: dict[str, Backend], timeout: float = 5, log_sink=None):
         self.backends = backends
         self.timeout = timeout
+        self.log_sink = log_sink
         self._processes: dict[str, subprocess.Popen] = {}
+        self._started: dict[str, float] = {}
+        self._commands: dict[str, list[str]] = {}
+        self._models: dict[str, str | None] = {}
         self._lock = threading.Lock()
 
-    def ensure_ready(self, backend_name: str) -> None:
+    def _pump_log(self, backend_name: str, process: subprocess.Popen) -> None:
+        # stderr потомка идёт и в консоль gate (как при ручном запуске), и в
+        # парсер метрик (prefill/decode t/s у ds4)
+        if process.stderr is None:
+            return
+        try:
+            for line in process.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                if self.log_sink:
+                    try:
+                        self.log_sink(backend_name, line)
+                    except Exception:
+                        pass
+        except (OSError, TypeError, ValueError):
+            return  # pipe закрылся или мок в тестах
+
+    def ensure_ready(self, backend_name: str, model: str | None = None) -> None:
         backend = self.backends[backend_name]
-        if not backend.autostart_command:
+        command = backend.command_for(model) if model is not None else backend.autostart_command
+        if not command:
             return
         with self._lock:
-            if self._ready(backend):
-                return
+            restarting = False
             process = self._processes.get(backend_name)
             if process is not None and process.poll() is not None:
                 self._processes.pop(backend_name, None)
+                self._commands.pop(backend_name, None)
+                self._models.pop(backend_name, None)
                 process = None
+            if process is not None and self._commands.get(backend_name) != command:
+                self._stop(process)
+                restarting = True
+                self._processes.pop(backend_name, None)
+                self._commands.pop(backend_name, None)
+                self._models.pop(backend_name, None)
+                process = None
+            if process is None and not restarting and self._ready(backend):
+                return
             if process is None:
                 try:
                     process = subprocess.Popen(
-                        backend.autostart_command,
+                        command,
                         start_new_session=True,
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
                     )
                 except OSError as error:
                     raise LifecycleError(
                         f"failed to start {backend_name}: {error}"
                     ) from error
                 self._processes[backend_name] = process
+                self._started[backend_name] = time.time()
+                self._commands[backend_name] = command
+                self._models[backend_name] = model
+                threading.Thread(
+                    target=self._pump_log, args=(backend_name, process), daemon=True
+                ).start()
 
             deadline = time.monotonic() + backend.startup_timeout
             while time.monotonic() < deadline:
@@ -148,6 +199,35 @@ class ProcessManager:
                 f"{backend_name} did not become ready within {backend.startup_timeout:g}s"
             )
 
+    def _stop(self, process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def snapshot(self) -> dict[str, dict[str, object]]:
+        with self._lock:
+            return {
+                name: {"running": True, "pid": process.pid, "model": self._models.get(name),
+                      "started_ts": self._started.get(name)}
+                for name, process in self._processes.items()
+                if process.poll() is None
+            }
+
+    def stop(self, backend_name: str) -> bool:
+        with self._lock:
+            process = self._processes.pop(backend_name, None)
+            self._started.pop(backend_name, None)
+            self._commands.pop(backend_name, None)
+            self._models.pop(backend_name, None)
+        if process is None or process.poll() is not None:
+            return False
+        self._stop(process)
+        return True
+
     def stop_all(self) -> None:
         with self._lock:
             processes = [
@@ -157,14 +237,19 @@ class ProcessManager:
             ]
             for name, _ in processes:
                 self._processes.pop(name, None)
+                self._commands.pop(name, None)
+                self._models.pop(name, None)
         for _, process in processes:
             if process.poll() is None:
                 process.terminate()
 
-    def _ready(self, backend: Backend) -> bool:
+    def is_ready(self, backend_name: str, timeout: float | None = None) -> bool:
+        return self._ready(self.backends[backend_name], timeout)
+
+    def _ready(self, backend: Backend, timeout: float | None = None) -> bool:
         request = Request(backend.base_url + backend.ready_path, method="GET")
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout if timeout is None else timeout) as response:
                 return 200 <= response.status < 300
         except (HTTPError, URLError, TimeoutError, OSError):
             return False
@@ -234,8 +319,10 @@ class Lifecycle:
                 unloaded = True
             elif backend.unload_url:
                 for model in models:
-                    self._post(backend.admin_url(backend.unload_url, model))
-                    unloaded = True
+                    # ponytail: skip unload for models the backend already dropped (e.g. OMLX TTL)
+                    if self._is_loaded(backend, model):
+                        self._post(backend.admin_url(backend.unload_url, model))
+                        unloaded = True
             elif backend.requires_unload and self.require_unload:
                 raise LifecycleError(
                     f"refusing switch {backend_name}->{target}: no unload hook configured for {backend_name}"
@@ -243,6 +330,10 @@ class Lifecycle:
             self._models[backend_name].difference_update(models)
             if unloaded and backend.unload_settle_seconds:
                 self.sleep(backend.unload_settle_seconds)
+
+    def snapshot(self) -> dict[str, list[str]]:
+        with self._lock:
+            return {name: sorted(models) for name, models in self._models.items()}
 
     def _post(self, url: str) -> None:
         request = Request(
@@ -262,6 +353,14 @@ class Lifecycle:
 class GateServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        # keep-alive соединение сбросил клиент (abort/отмена Pi) — штатная
+        # ситуация, а не ошибка прокси; не засоряем лог трейсбеками сокета
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
     def __init__(self, address, handler, config: dict):
         self.backends = {
             name: Backend.from_config(name, backend_config)
@@ -280,11 +379,15 @@ class GateServer(ThreadingHTTPServer):
             require_unload=config.get("require_unload", True),
             timeout=float(config.get("lifecycle_timeout", 30)),
         )
-        self.processes = ProcessManager(self.backends)
+        self.stats = StatsCollector()
+        self.processes = ProcessManager(self.backends, log_sink=self.stats.record_backend_log)
         self.max_body_bytes = int(config.get("max_body_bytes", 64 * 1024 * 1024))
         self.upstream_timeout = float(config.get("upstream_timeout", 600))
         self.failure_cooldown = float(config.get("lifecycle_failure_cooldown", 5))
         self.state_lock = threading.Lock()
+        # живые запросы для отмены из панели: id InFlight -> активный handler
+        self.active_requests: dict[int, "ProxyHandler"] = {}
+        self._active_lock = threading.Lock()
         self._blocked_until = 0.0
         self._blocked_reason = ""
         super().__init__(address, handler)
@@ -317,6 +420,28 @@ class GateServer(ThreadingHTTPServer):
                     LOGGER.warning("model discovery unavailable backend=%s", name)
             self.router = ModelRouter({name: backend.__dict__ for name, backend in self.backends.items()})
 
+    def admin_status(self) -> dict[str, object]:
+        admission = self.gate.snapshot()
+        processes = self.processes.snapshot()
+        loaded = self.lifecycle.snapshot()
+        active = admission["models"]
+        backends = []
+        for name, backend in self.backends.items():
+            process = processes.get(name)
+            models = sorted(set(backend.models) | set(backend.model_commands) | set(backend.model_policies))
+            backends.append({
+                "name": name,
+                "ready": self.processes.is_ready(name, timeout=0.2),
+                "process": process,
+                "models": [{
+                    "id": model,
+                    "active": active.get(f"{name}/{model}", 0),
+                    "loaded": model in loaded[name],
+                    "running": bool(process and process["model"] == model),
+                } for model in models],
+            })
+        return {**admission, "backends": backends}
+
     def lifecycle_available(self) -> tuple[bool, str]:
         with self.state_lock:
             if time.monotonic() < self._blocked_until:
@@ -338,6 +463,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
+        if self.path == "/admin/status":
+            if self._admin_allowed():
+                self._json(200, self.server.admin_status())
+            return
+        if self.path == "/admin/stats":
+            if self._admin_allowed():
+                self._json(200, self.server.stats.snapshot())
+            return
         if self.path == "/healthz":
             self._json(200, {"ok": True, **self.server.gate.snapshot()})
             return
@@ -371,6 +504,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "only GET /v1/models, GET /<backend>/v1/models and POST /v1/* are proxied"})
 
     def do_POST(self) -> None:
+        if self.path == "/admin/stop":
+            self._stop_backend()
+            return
+        if self.path == "/admin/cancel":
+            self._cancel_request()
+            return
         # /<backend>/v1/* is a per-backend view: strip the prefix, routing is
         # still by model name (the prefix is for discovery, not access control).
         view_backend: str | None = None
@@ -411,13 +550,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         stream = bool(payload.get("stream", False))
         context_chars = _context_chars(payload)
+        backend = self.server.backends[backend_name]
+        if stream and self.path == "/v1/chat/completions" and backend.inject_stream_usage:
+            # ds4 и omlx отдают точный usage в последнем SSE-чанке только по
+            # запросу; просим его сами, клиенты (OpenAI-совместимые) его игнорируют
+            options = payload.setdefault("stream_options", {})
+            if isinstance(options, dict) and not options.get("include_usage"):
+                options["include_usage"] = True
+                body = json.dumps(payload, ensure_ascii=False).encode()
+        inflight = self.server.stats.start(model, backend_name, stream, context_chars)
+        with self.server._active_lock:
+            self.server.active_requests[inflight.id] = self
         try:
             if lease.initialize:
                 self.server.lifecycle.activate(backend_name, model, lease.sharing_group)
-                self.server.processes.ensure_ready(backend_name)
+                self.server.processes.ensure_ready(backend_name, model)
                 self.server.clear_lifecycle_failure()
                 lease.mark_ready()
-            status = self._forward(self.server.backends[backend_name], body)
+            status = self._forward(backend, body, inflight)
+            self.server.stats.finish(inflight, status=status)
             LOGGER.info(
                 "request model=%s backend=%s stream=%s context_chars=%d status=%d elapsed=%.3fs",
                 model,
@@ -428,10 +579,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 time.monotonic() - started,
             )
         except LifecycleError as error:
+            self.server.stats.finish(inflight, status=503, error=str(error))
             self.server.block_lifecycle(str(error))
             LOGGER.error("request model=%s backend=%s status=503 error=%s", model, backend_name, error)
             self._json(503, {"error": str(error)})
         except (BrokenPipeError, ConnectionResetError):
+            self.server.stats.finish(inflight, status=0, disconnected=True)
             LOGGER.info(
                 "request disconnected model=%s backend=%s stream=%s elapsed=%.3fs",
                 model,
@@ -440,13 +593,73 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 time.monotonic() - started,
             )
         except (HTTPError, URLError, OSError) as error:
+            self.server.stats.finish(inflight, status=502, error=str(error))
             LOGGER.error("request model=%s backend=%s status=502 error=%s", model, backend_name, error)
             self._json(502, {"error": f"upstream request failed: {error}"})
         except Exception as error:  # keep the proxy fail-closed on malformed upstreams
+            self.server.stats.finish(inflight, status=502, error=str(error))
             LOGGER.exception("request model=%s backend=%s status=502", model, backend_name)
             self._json(502, {"error": f"proxy request failed: {error}"})
         finally:
+            with self.server._active_lock:
+                for key, handler in list(self.server.active_requests.items()):
+                    if handler is self:
+                        self.server.active_requests.pop(key, None)
             lease.release()
+
+    def _admin_allowed(self) -> bool:
+        if self.client_address[0] in {"127.0.0.1", "::1"}:
+            return True
+        self._json(403, {"error": "admin API is local only"})
+        return False
+
+    def cancel(self) -> None:
+        # рвём оба конца: клиентское соединение и апстрим — генерация у
+        # ds4/omlx оборвётся на ближайшей записи, поток копирования упадёт в
+        # штатный except и запрос засчитается как disconnected
+        upstream = getattr(self, "_upstream", None)
+        if upstream is not None:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.close_connection = True
+
+    def _stop_backend(self) -> None:
+        if not self._admin_allowed():
+            return
+        try:
+            backend = json.loads(self._read_body()).get("backend")
+            if not isinstance(backend, str) or backend not in self.server.backends:
+                raise ValueError("known JSON field 'backend' is required")
+        except (ValueError, json.JSONDecodeError) as error:
+            self._json(400, {"error": str(error)})
+            return
+        if not self.server.processes.stop(backend):
+            self._json(404, {"error": f"no managed process for backend: {backend}"})
+            return
+        self._json(200, {"ok": True, "backend": backend})
+
+    def _cancel_request(self) -> None:
+        if not self._admin_allowed():
+            return
+        try:
+            request_id = int(json.loads(self._read_body()).get("id"))
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            self._json(400, {"error": f"JSON field 'id' is required: {error}"})
+            return
+        with self.server._active_lock:
+            handler = self.server.active_requests.get(request_id)
+        if handler is None:
+            self._json(404, {"error": f"no in-flight request: {request_id}"})
+            return
+        handler.cancel()
+        LOGGER.info("request cancelled id=%d by admin", request_id)
+        self._json(200, {"ok": True, "cancelled": request_id})
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
@@ -454,7 +667,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid or oversized Content-Length")
         return self.rfile.read(length)
 
-    def _forward(self, backend: Backend, body: bytes) -> int:
+    def _forward(self, backend: Backend, body: bytes, inflight: InFlight | None = None) -> int:
         request_headers = {
             key: value
             for key, value in self.headers.items()
@@ -468,31 +681,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
             headers=request_headers,
         )
         with urlopen(request, timeout=self.server.upstream_timeout) as response:
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None:
-                self.send_response(response.status)
-                self._copy_headers(response.headers, skip={"content-length", "connection", "transfer-encoding"})
-                self.send_header("Content-Length", content_length)
-                self.end_headers()
-                self._copy_stream(response)
-                return response.status
+            self._upstream = response  # для отмены из панели (POST /admin/cancel)
+            try:
+                return self._relay(response, inflight)
+            finally:
+                self._upstream = None
 
+    def _relay(self, response, inflight: "InFlight | None") -> int:
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
             self.send_response(response.status)
             self._copy_headers(response.headers, skip={"content-length", "connection", "transfer-encoding"})
-            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Length", content_length)
             self.end_headers()
-            for chunk in iter(lambda: response.read1(64 * 1024), b""):
-                self.wfile.write(f"{len(chunk):X}\r\n".encode())
-                self.wfile.write(chunk)
-                self.wfile.write(b"\r\n")
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
+            self._copy_stream(response, inflight)
             return response.status
 
-    def _copy_stream(self, response) -> None:
+        self.send_response(response.status)
+        self._copy_headers(response.headers, skip={"content-length", "connection", "transfer-encoding"})
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
         for chunk in iter(lambda: response.read1(64 * 1024), b""):
+            if inflight:
+                inflight.feed(chunk)
+            self.wfile.write(f"{len(chunk):X}\r\n".encode())
+            self.wfile.write(chunk)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+        if inflight:
+            inflight.parse_usage()
+        return response.status
+
+    def _copy_stream(self, response, inflight: InFlight | None = None) -> None:
+        for chunk in iter(lambda: response.read1(64 * 1024), b""):
+            if inflight:
+                inflight.feed(chunk)
             self.wfile.write(chunk)
             self.wfile.flush()
+        if inflight:
+            inflight.parse_usage()
 
     def _copy_headers(self, headers, skip: set[str]) -> None:
         for key, value in headers.items():
@@ -521,6 +749,13 @@ def serve(config_path: str | Path) -> None:
     listen = config.get("listen", "127.0.0.1:9000")
     host, port = listen.rsplit(":", 1)
     server = GateServer((host, int(port)), ProxyHandler, config)
+
+    def terminate(signum, frame):
+        # SIGTERM должен пройти через finally: иначе stop_all не отработает и
+        # ds4 останется сиротой, а новый гейт его лишь "усыновит" без stderr
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, terminate)
     print(f"model-gate listening on http://{listen}", flush=True)
     try:
         server.serve_forever()
