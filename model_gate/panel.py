@@ -474,10 +474,21 @@ class Poller(threading.Thread):
 
 def box(title: str, inner: list[list[Seg]], width: int) -> list[list[Seg]]:
     inner_width = width - 4
+    title = title[:max(0, width - 6)]  # заголовок не должен разрывать рамку
     lines: list[list[Seg]] = [[("┌─ ", "dim"), (title, "head"),
                                (" " + "─" * max(0, width - len(title) - 5), "dim"), ("┐", "dim")]]
     for segs in inner:
         used = sum(len(text) for text, _ in segs)
+        if used > inner_width:  # узкий терминал: режем строку, а не ломаем сетку
+            clipped: list[Seg] = []
+            left = inner_width
+            for text, role in segs:
+                if left <= 0:
+                    break
+                clipped.append((text[:left], role))
+                left -= len(text)
+            segs = clipped
+            used = inner_width
         pad = max(0, inner_width - used)
         lines.append([("│ ", "dim")] + segs + [(" " * pad, "dim"), (" │", "dim")])
     lines.append([("└" + "─" * (width - 2) + "┘", "dim")])
@@ -667,13 +678,14 @@ def system_section(state: dict, width: int) -> list[list[Seg]]:
     return box("SYSTEM", subs + [[(footer, "dim")]], width)
 
 
-def backends_section(state: dict, width: int, sel: dict | None = None) -> list[list[Seg]]:
-    """Каждый провайдер — отдельный бокс, рядом |ds4|omlx|, модели списком."""
+def backends_section(state: dict, width: int, sel: dict | None = None,
+                     vertical: bool = False) -> list[list[Seg]]:
+    """Каждый провайдер — отдельный бокс: горизонтально |ds4|omlx| или стеком (узкий режим)."""
     status = state.get("gate_status") or {}
     stats = state.get("gate_stats") or {}
     metrics = stats.get("backend_metrics", {})
     omlx = state.get("omlx") or {}
-    sub_width = (width - 4 - 1) // 2
+    sub_width = width - 4 if vertical else (width - 4 - 1) // 2
     now = time.time()
     groups: list[tuple[str, list[list[Seg]]]] = []
     for backend in sorted(status.get("backends", []), key=lambda b: b["name"]):
@@ -727,19 +739,38 @@ def backends_section(state: dict, width: int, sel: dict | None = None) -> list[l
         groups.append((name, inner))
     if not groups:
         return box("BACKENDS", [[(" no data from gate", "warn")]], width)
-    # высоты боксов синхронны: короткий дополняем пустыми строками до максимума
+    if vertical:
+        lines: list[list[Seg]] = []
+        for name, inner in groups:
+            lines += box(name, inner, width)
+        return lines
     height = max(len(inner) for _, inner in groups)
     boxes = [box(name, inner + [[]] * (height - len(inner)), sub_width)
              for name, inner in groups]
     return box("BACKENDS", merge_boxes(boxes, gap=1), width)
 
 
-def models_section(state: dict, width: int) -> list[list[Seg]]:
+def models_section(state: dict, width: int, compact: bool = False) -> list[list[Seg]]:
     stats = state.get("gate_stats") or {}
     models = stats.get("models", {})
     inner: list[list[Seg]] = []
     if not models:
         inner.append([(" no traffic yet", "dim")])
+    elif compact:
+        # узкий режим: только главные колонки, модель во всю оставшуюся ширину
+        name_w = max(6, width - 4 - 23)
+        inner.append([(f" {'model':<{name_w}}", "dim"), (f"{'req':>5}", "dim"),
+                      (f"{'in':>6}", "dim"), (f"{'out':>6}", "dim"), (f"{'t/s':>5}", "dim")])
+        for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
+            model = models[key]
+            avg_tps = model.get("avg_tps")
+            short = key.replace("ds4/", "d:").replace("omlx/", "o:")
+            role = "ok" if model["errors"] == 0 else "warn"
+            inner.append([(f" {short[:name_w]:<{name_w}}", role),
+                          (f"{model['requests']:>5}", "fg"),
+                          (f"{fmt_n(model['prompt_tokens']):>6}", "fg"),
+                          (f"{fmt_n(model['completion_tokens']):>6}", "fg"),
+                          (f"{(f'{avg_tps:.0f}' if avg_tps else '—'):>5}", "orange")])
     else:
         inner.append([(" model" + " " * 29, "dim"), (f"{'req':>5}", "dim"), (f"{'in':>7}", "dim"),
                       (f"{'out':>7}", "dim"), (f"{'cache':>6}", "dim"), (f"{'pre t/s':>8}", "dim"),
@@ -763,13 +794,34 @@ def models_section(state: dict, width: int) -> list[list[Seg]]:
     return box("MODELS (since gate start)", inner, width)
 
 
-def recent_section(state: dict, width: int, limit: int) -> list[list[Seg]]:
+def recent_section(state: dict, width: int, limit: int, compact: bool = False) -> list[list[Seg]]:
     stats = state.get("gate_stats") or {}
     recent = state.get("_recent_view", stats.get("recent", []))[:limit]
     inner: list[list[Seg]] = []
     if not recent:
         inner.append([(" no traffic yet", "dim")])
-        return box("RECENT REQUESTS  (PgUp/PgDn)", inner, width)
+        return box("RECENT" if compact else "RECENT REQUESTS  (PgUp/PgDn)", inner, width)
+    if compact:
+        name_w = max(6, width - 4 - 28)
+        inner.append([(f" {'hh:mm':<5}", "dim"), (f" {'model':<{name_w}}", "dim"),
+                      (f"{'ok':>4}", "dim"), (f"{'dur':>6}", "dim"),
+                      (f"{'out':>6}", "blue"), (f"{'t/s':>5}", "orange")])
+        for record in recent:
+            stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M")
+            if record.get("disconnected"):
+                flag, role = "ABRT", "warn"
+            elif record["status"] >= 400:
+                flag, role = str(record["status"]), "err"
+            else:
+                flag, role = "200", "ok"
+            tps = f"{record['tps']:.0f}" if record.get("tps") else "—"
+            inner.append([(f" {stamp:<5}", "dim"),
+                          (f" {record['model'][:name_w]:<{name_w}}", "fg"),
+                          (f"{flag:>4}", role),
+                          (f"{record['elapsed_s']:>5.0f}s", "fg"),
+                          (f"{fmt_n(record['completion_tokens']):>6}", "blue"),
+                          (f"{tps:>5}", "orange")])
+        return box("RECENT", inner, width)
     # колонки: каждая своим цветом — время тусклое, модель обычная, статус
     # по результату, токены синие, кэш розовый, скорости оранжевые
     inner.append([(f" {'time':<8}", "dim"), (f" {'model':<24}", "dim"), (" " + f"{'code':>4}", "dim"),
@@ -799,7 +851,114 @@ def recent_section(state: dict, width: int, limit: int) -> list[list[Seg]]:
     return box("RECENT REQUESTS  (PgUp/PgDn)", inner, width)
 
 
-def render(state: dict, width: int, height: int, sel: dict | None = None) -> list[list[Seg]]:
+def spark(values, ceiling: float, n: int) -> str:
+    """Однострочный спарклайн из последних n значений."""
+    tail = list(values)[-n:] or [0.0]
+    return "".join(EIGHTHS[max(0, min(8, round(v / max(ceiling, 1e-9) * 8)))] for v in tail)
+
+
+def compact_header_section(state: dict, width: int, sel: dict | None = None) -> list[list[Seg]]:
+    """Узкий режим: лого рисуется не нужен — только статус, энергопотребление и LIVE."""
+    stats = state.get("gate_stats") or {}
+    status = state.get("gate_status") or {}
+    metrics = stats.get("backend_metrics", {})
+    inflight = stats.get("inflight", [])
+    live_tps = sum(
+        entry["approx_completion_tokens"] / (entry["elapsed_s"] - (entry["ttft_s"] or 0))
+        for entry in inflight
+        if entry.get("approx_completion_tokens") and entry["elapsed_s"] - (entry["ttft_s"] or 0) > 0.3
+    )
+    prefill = max((m.get("prefill_avg_tps") or m.get("prefill_last_tps") or 0 for m in metrics.values()), default=0)
+    active = status.get("active", 0)
+    queue = status.get("waiting_exclusive", 0)
+    info = [[
+        (f"up {fmt_g(stats.get('uptime_s'))}", "fg"), (" · ", "dim"),
+        (str(active), "live" if active else "dim"), ("act", "dim"), (" · ", "dim"),
+        (str(queue), "warn" if queue else "dim"), ("q", "dim"), (" · ", "dim"),
+        (f"{state['rates']['req_min']}/min", "blue"),
+    ]]
+    watts = state.get("sys_watts")
+    gpu_pct = state.get("gpu_pct")
+    temp = state.get("gpu_temp")
+    power_line: list[Seg] = [("gen ", "dim"), (f"{live_tps:.0f}", "orange"), (" · pre ", "dim"),
+                             (f"{prefill:.0f} t/s", "orange")]
+    # хвост со всякой всячиной добавляем, пока влезает в ширину
+    used = sum(len(text) for text, _ in power_line)
+    for extra in (
+        [(" · ", "dim"), (f"⚡{watts:.0f}W", "warn")] if watts is not None else [],
+        [(" · ", "dim"), (f"{temp:.0f}°C", "live")] if temp is not None else [],
+        [(" · ", "dim"), (f"{gpu_pct:.0f}%", "orange")] if gpu_pct is not None else [],
+    ):
+        cost = sum(len(text) for text, _ in extra)
+        if used + cost <= width - 4:
+            power_line += extra
+            used += cost
+    info.append(power_line)
+    lines = box("model-gate · -lynxy-dev-", info, width)
+
+    spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time()) % 10]
+    live_inner: list[list[Seg]] = []
+    if not inflight:
+        live_inner = [[(f"{spinner} idle", "dim")]]
+    for entry in inflight[:3]:
+        elapsed, ttft = entry["elapsed_s"], entry["ttft_s"]
+        approx = entry.get("approx_completion_tokens") or 0
+        gen_time = (elapsed - ttft) if ttft else 0
+        tps = (approx / gen_time) if approx and gen_time > 0.3 else None
+        cursor = sel and sel["kind"] == "inflight" and sel["id"] == entry["id"]
+        segs: list[Seg] = [("▸" if cursor else " ", "live"), (f"{spinner} ", "live"),
+                           (f"{entry['model'][:12]} ", "fg"),
+                           ("gen" if ttft else "pre", "live" if ttft else "orange"),
+                           (f" {elapsed:.0f}s", "dim")]
+        if tps:
+            segs.append((f" {tps:.0f}t/s", "orange"))
+        live_inner.append(segs)
+    lines += box("LIVE", live_inner, width)
+    return lines
+
+
+def compact_system_section(state: dict, width: int) -> list[list[Seg]]:
+    """Узкий режим: по однострочному спарклайну на метрику вместо четырёхстрочных графиков."""
+    hist = state["hist"]
+    sysinfo = state.get("sys") or {}
+    cpu = state.get("cpu")
+    gpu_pct = state.get("gpu_pct")
+    pool = ((state.get("omlx") or {}).get("active_models") or {})
+    n = width - 4 - 9
+    rows: list[list[Seg]] = []
+    if cpu is not None:
+        rows.append([("cpu ", "dim"), (f"{cpu:>3.0f}% ", "fg"), (spark(hist["cpu"], 100.0, n), "blue")])
+    if gpu_pct is not None:
+        rows.append([("gpu ", "dim"), (f"{gpu_pct:>3.0f}% ", "fg"), (spark(hist["gpu"], 100.0, n), "orange")])
+    elif pool.get("model_memory_max"):
+        pool_frac = pool["model_memory_used"] / pool["model_memory_max"]
+        rows.append([("pool", "dim"), (f"{pool_frac * 100:>3.0f}% ", "fg"),
+                     (spark(hist["pool"], 1.0, n), "orange")])
+    mem_frac = sysinfo.get("mem_frac")
+    if mem_frac is not None:
+        rows.append([("ram ", "dim"), (f"{mem_frac * 100:>3.0f}% ", "fg"), (spark(hist["mem"], 1.0, n), "live")])
+    temp = state.get("gpu_temp")
+    if temp is not None:
+        rows.append([("tmp ", "dim"), (f"{temp:>3.0f}° ", "fg"), (spark(hist["temp"], 110.0, n), "warn")])
+    watts = state.get("sys_watts")
+    if watts is not None:
+        rows.append([("pwr ", "dim"), (f"{watts:>3.0f}W ", "fg"), (spark(hist["watts"], 150.0, n), "warn")])
+    if not rows:
+        rows = [[(" no data", "dim")]]
+    return box("SYSTEM", rows, width)
+
+
+def render(state: dict, width: int, height: int, sel: dict | None = None,
+           compact: bool = False) -> list[list[Seg]]:
+    if compact:
+        lines = compact_header_section(state, width, sel)
+        lines += compact_system_section(state, width)
+        lines += backends_section(state, width, sel, vertical=True)
+        lines += models_section(state, width, compact=True)
+        fixed = len(lines)
+        limit = max(1, min(10, height - fixed - 2))
+        lines += recent_section(state, width, limit, compact=True)
+        return lines
     lines = header_section(state, width, sel)
     lines += system_section(state, width)
     lines += backends_section(state, width, sel)
@@ -811,10 +970,11 @@ def render(state: dict, width: int, height: int, sel: dict | None = None) -> lis
 
 
 def draw(screen, state: dict, colors: dict, sel: dict | None = None,
-         actions: "Actions | None" = None, pending: tuple | None = None) -> None:
+         actions: "Actions | None" = None, pending: tuple | None = None,
+         compact: bool = False) -> None:
     height, width = screen.getmaxyx()
     screen.erase()
-    for y, segs in enumerate(render(state, width - 1, height, sel)[:height - 1]):
+    for y, segs in enumerate(render(state, width - 1, height, sel, compact)[:height - 1]):
         x = 0
         for text, role in segs:
             if x >= width - 1:
@@ -830,7 +990,10 @@ def draw(screen, state: dict, colors: dict, sel: dict | None = None,
     else:
         status = actions.status() if actions else ""
         hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
-        footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · j/k select · PgUp/PgDn log{hint}"
+        if compact:
+            footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p jk PgUp c{hint}"
+        else:
+            footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · j/k select · PgUp/PgDn log{hint}"
         attr = curses.A_REVERSE
     try:
         screen.addnstr(height - 1, 0, footer, width - 1, attr)
@@ -849,6 +1012,8 @@ def main() -> None:
     parser.add_argument("--omlx-url", default="http://127.0.0.1:8001")
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True,
                         help="real GPU%% via sudo powermetrics (по умолчанию вкл; --no-gpu выключает)")
+    parser.add_argument("--compact", action="store_true",
+                        help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
     parser.add_argument("--once", action="store_true", help="single frame to stdout, no curses")
     args = parser.parse_args()
 
@@ -872,7 +1037,7 @@ def main() -> None:
             poller.state["gate_stats"] and poller.state["sys"] and poller.state["cpu"] is not None
         ):
             time.sleep(0.3)
-        for segs in render(poller.state, 110, 60):
+        for segs in render(poller.state, 46 if args.compact else 110, 60, compact=args.compact):
             print(flatten(segs))
         poller.stop()
         return
@@ -894,6 +1059,8 @@ def main() -> None:
         poller.start()
         actions = Actions(args.url, args.omlx_url)
         paused, scroll, sel_index, pending = False, 0, 0, None
+        # узкий режим: флаг, авто по ширине терминала, или клавиша c на лету
+        compact = args.compact or screen.getmaxyx()[1] < 80
         while True:
             screen.timeout(500)
             key = screen.getch()
@@ -901,6 +1068,8 @@ def main() -> None:
                 break
             if key == ord("p"):
                 paused = not paused
+            if key == ord("c"):
+                compact = not compact
             with poller.lock:
                 state = dict(poller.state)
                 recent = list((state.get("gate_stats") or {}).get("recent", []))
@@ -954,7 +1123,7 @@ def main() -> None:
                 sel_index = max(0, sel_index - 1)
             if not paused:
                 state["_recent_view"] = recent[scroll:]
-                draw(screen, state, colors, sel, actions, pending)
+                draw(screen, state, colors, sel, actions, pending, compact)
         poller.stop()
 
     curses.wrapper(wrapper)

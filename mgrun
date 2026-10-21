@@ -74,6 +74,7 @@ def main() -> None:
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True,
                         help="GPU%% в панели (sudo powermetrics), по умолчанию вкл; --no-gpu выключает")
     parser.add_argument("--stop", action="store_true", help="остановить gate и выйти")
+    parser.add_argument("--compact", action="store_true", help="узкий режим панели (боковая панель, телефон)")
     args = parser.parse_args()
     config = Path(args.config)
     url = gate_url_from_config(config)
@@ -98,7 +99,7 @@ def main() -> None:
         print(f"model-gate поднялся на {url}")
 
     # argv[0] — реальный путь: клавиша R в панели перезапускается через execv
-    sys.argv = [str(REPO / "mgpan"), "--url", url, "--gpu" if args.gpu else "--no-gpu"]
+    sys.argv = [str(REPO / "mgpan"), "--url", url, "--gpu" if args.gpu else "--no-gpu"] + (["--compact"] if args.compact else [])
     sys.path.insert(0, str(REPO))
     from model_gate.panel import main as panel_main
     panel_main()
