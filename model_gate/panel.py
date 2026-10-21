@@ -815,10 +815,11 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
         inner.append([("no traffic yet", "dim")])
         return box("RECENT" if compact else "RECENT REQUESTS  (PgUp/PgDn)", inner, width)
     if compact:
-        # без колонки статуса: имя модели зелёное при 200, красное при ошибке
-        name_w = max(6, width - 4 - 29)
+        # без колонки статуса: имя модели зелёное при 200, красное при ошибке;
+        # dur убран — cache-хит по каждому запросу важнее длительности
+        name_w = max(6, width - 4 - 28)
         inner.append([(f"{'hh:mm':<6}", "dim"), (f"{'model':<{name_w}}", "dim"),
-                      (f"{'dur':>6}", "dim"), (f"{'out':>6}", "blue"),
+                      (f"{'cache':>5}", "live"), (f"{'out':>6}", "blue"),
                       (f"{'t/s':>5}", "orange"), (f"{'pre':>6}", "orange")])
         for record in recent:
             stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M")
@@ -830,9 +831,11 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
                 role = "ok"
             tps = f"{record['tps']:.0f}" if record.get("tps") else "—"
             prefill = f"{record['prefill_tps']:.0f}" if record.get("prefill_tps") else "—"
+            prompt, cached = record.get("prompt_tokens") or 0, record.get("cached_tokens") or 0
+            reuse = f"{100 * cached / prompt:.0f}%" if prompt and cached else "—"
             inner.append([(f"{stamp:<6}", "dim"),
                           (f"{record['model'][:name_w]:<{name_w}}", role),
-                          (f"{record['elapsed_s']:>5.0f}s", "fg"),
+                          (f"{reuse:>5}", "live"),
                           (f"{fmt_n(record['completion_tokens']):>6}", "blue"),
                           (f"{tps:>5}", "orange"),
                           (f"{prefill:>6}", "orange")])

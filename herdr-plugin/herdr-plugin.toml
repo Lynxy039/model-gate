@@ -1,22 +1,44 @@
 id = "lynxy.model-gate"
 name = "model-gate"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.5"
-description = "Панель мониторинга model-gate (mgpan) в pane herdr: LIVE-запросы, бэкенды, графики, управление."
+description = "Панель мониторинга model-gate (mgpan) как сайдбар herdr: висит во всех workspace, LIVE-запросы, бэкенды, графики, управление."
 platforms = ["macos", "linux"]
 
-# pane открывает mgrun: поднимет gate, если не поднят, и покажет панель.
-# Узкий pane — панель сама перейдёт в компактный режим (ширина <80).
+# startup: развесить панель по всем workspace после старта/перезапуска сервера
+[[startup]]
+command = ["./ensure-panes.sh"]
+
+# новый workspace — панель цепляется туда сама
+[[events]]
+on = "workspace.created"
+command = ["./on-workspace.sh"]
+
+# pane открывает mgrun: поднимет gate, если не поднят, и покажет панель
+# (--no-gpu: экземпляров много, powermetrics каждый секунду слишком дорог)
 [[panes]]
 id = "mgpan"
 title = "model-gate"
 placement = "split"
 command = ["./mgpan-pane.sh"]
 
-# быстрый вызов из меню действий, если сплит не нужен надолго
+[[actions]]
+id = "toggle"
+title = "Toggle model-gate panel"
+description = "Закрыть панель в текущем workspace или открыть, если закрыта."
+contexts = ["workspace"]
+command = ["./toggle-pane.sh"]
+
 [[actions]]
 id = "open"
 title = "Open model-gate panel"
-description = "Открыть mgpan в split-панели (gate поднимется при необходимости)."
+description = "Открыть mgpan в split-панели текущего workspace."
 contexts = ["workspace"]
 command = ["./open-pane.sh"]
+
+# prefix+g — открыть/закрыть панель (как prefix+l у лайаутов)
+[[keys.command]]
+key = "prefix+g"
+type = "plugin_action"
+command = "lynxy.model-gate.toggle"
+description = "toggle model-gate panel"
