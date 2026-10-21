@@ -1,0 +1,108 @@
+#!/usr/bin/env python3.11
+"""mgrun — запустить model-gate (если не поднят) и открыть панель mgpan.
+
+Идемпотентно: живой gate не перезапускается, панель просто подключается.
+Gate стартует независимо от терминала (start_new_session) — закрытие
+терминала или выход из панели (q) его не убивают. Выход вместе с gate:
+клавиша Q в панели (с подтверждением) или `mgrun --stop`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+REPO = Path(__file__).resolve().parent
+PID_FILE = Path("/tmp/model-gate.pid")
+
+
+def gate_alive(url: str) -> bool:
+    try:
+        with urlopen(Request(f"{url}/healthz"), timeout=2) as response:
+            return response.status == 200
+    except (URLError, OSError, ValueError):
+        return False
+
+
+def gate_url_from_config(config: Path) -> str:
+    try:
+        listen = json.loads(config.read_text()).get("listen", "127.0.0.1:9000")
+    except (OSError, ValueError):
+        listen = "127.0.0.1:9000"
+    host, _, port = listen.partition(":")
+    if host in ("0.0.0.0", ""):
+        host = "127.0.0.1"
+    return f"http://{host}:{port}"
+
+
+def stop_gate(url: str) -> None:
+    if PID_FILE.exists():
+        try:
+            os.kill(int(PID_FILE.read_text().strip()), signal.SIGTERM)
+            print(f"model-gate (pid {PID_FILE.read_text().strip()}) остановлен")
+        except (ProcessLookupError, ValueError):
+            print("процесс уже мёртв")
+        PID_FILE.unlink(missing_ok=True)
+    elif gate_alive(url):
+        sys.exit("gate жив, но pid-файла нет — убей сам: pkill -f 'model_gate --config'")
+    else:
+        print("gate и не запущен")
+
+
+def start_gate(config: Path) -> subprocess.Popen:
+    log = open(REPO / "model-gate.log", "ab", buffering=0)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "model_gate", "--config", str(config)],
+        cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        start_new_session=True,
+    )
+    PID_FILE.write_text(str(process.pid))
+    return process
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="model-gate + панель одним чохом")
+    parser.add_argument("--config", default=str(REPO / "model-gate.json"))
+    parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True,
+                        help="GPU%% в панели (sudo powermetrics), по умолчанию вкл; --no-gpu выключает")
+    parser.add_argument("--stop", action="store_true", help="остановить gate и выйти")
+    args = parser.parse_args()
+    config = Path(args.config)
+    url = gate_url_from_config(config)
+
+    if args.stop:
+        stop_gate(url)
+        return
+
+    if gate_alive(url):
+        print(f"model-gate уже работает на {url} — подключаю панель…")
+    else:
+        print(f"стартую model-gate ({config})…")
+        process = start_gate(config)
+        for _ in range(60):
+            if gate_alive(url):
+                break
+            if process.poll() is not None:
+                sys.exit(f"gate умер при старте (code {process.returncode}) — смотри {REPO / 'model-gate.log'}")
+            time.sleep(0.5)
+        else:
+            sys.exit(f"gate не поднялся за 30s — смотри {REPO / 'model-gate.log'}")
+        print(f"model-gate поднялся на {url}")
+
+    # argv[0] — реальный путь: клавиша R в панели перезапускается через execv
+    sys.argv = [str(REPO / "mgpan"), "--url", url, "--gpu" if args.gpu else "--no-gpu"]
+    sys.path.insert(0, str(REPO))
+    from model_gate.panel import main as panel_main
+    panel_main()
+
+
+if __name__ == "__main__":
+    main()
