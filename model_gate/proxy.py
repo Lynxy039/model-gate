@@ -105,10 +105,7 @@ class Backend:
 
     def admission_policy(self, model: str) -> AdmissionPolicy:
         config = self.model_policies.get(model, {})
-        return AdmissionPolicy(
-            max_concurrency=int(config.get("max_concurrency", self.max_concurrency)),
-            sharing_group=config.get("sharing_group"),
-        )
+        return AdmissionPolicy(max_concurrency=int(config.get("max_concurrency", self.max_concurrency)))
 
 
 class LifecycleError(RuntimeError):
@@ -273,18 +270,19 @@ class Lifecycle:
         self._models: dict[str, set[str]] = {name: set() for name in backends}
         self._lock = threading.Lock()
 
-    def activate(self, target: str, model: str, sharing_group: str | None) -> None:
-        """Make one model available without disturbing peers in its light group."""
+    def activate(self, target: str, model: str) -> None:
+        """Сделать доступной одну модель; всё остальное выгружается.
+
+        Одновременной работы нескольких моделей гейт не допускает (см.
+        AdmissionGate), поэтому выгружать надо не «конкурентов по группе»,
+        а любой ранее загруженный лиз.
+        """
         with self._lock:
             unload = [
                 (backend_name, loaded_model)
                 for backend_name, models in self._models.items()
                 for loaded_model in models
                 if (backend_name, loaded_model) != (target, model)
-                and (
-                    sharing_group is None
-                    or self.backends[backend_name].admission_policy(loaded_model).sharing_group != sharing_group
-                )
             ]
             self._unload(unload, target)
             backend = self.backends[target]
@@ -629,7 +627,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.server.active_requests[inflight.id] = self
         try:
             if lease.initialize:
-                self.server.lifecycle.activate(backend_name, model, lease.sharing_group)
+                self.server.lifecycle.activate(backend_name, model)
                 self.server.processes.ensure_ready(backend_name, model)
                 self.server.clear_lifecycle_failure()
                 lease.mark_ready()

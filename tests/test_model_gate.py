@@ -16,64 +16,49 @@ from model_gate.tui import model_rows
 class AdmissionGateTests(unittest.TestCase):
     def setUp(self):
         self.gate = AdmissionGate({
-            ("omlx", "coder"): AdmissionPolicy(8, "light"),
-            ("omlx", "thinking"): AdmissionPolicy(2, "light"),
-            ("omlx", "heavy-122b"): AdmissionPolicy(),
+            ("omlx", "coder"): AdmissionPolicy(2),
+            ("omlx", "thinking"): AdmissionPolicy(2),
             ("ds4", "flash"): AdmissionPolicy(),
         })
 
-    def test_light_models_run_together(self):
-        coder = self.gate.acquire("omlx", "coder")
-        coder.mark_ready()
-        thinking = self.gate.acquire("omlx", "thinking")
-        thinking.mark_ready()
+    def test_same_model_uses_its_own_concurrency(self):
+        first = self.gate.acquire("omlx", "coder")
+        first.mark_ready()
+        second = self.gate.acquire("omlx", "coder")
 
         self.assertEqual(self.gate.snapshot()["active"], 2)
-        coder.release()
-        thinking.release()
+        first.release()
+        second.release()
 
-    def test_heavy_model_waits_for_every_light_request(self):
+    def test_another_model_waits_for_every_lease(self):
         coder = self.gate.acquire("omlx", "coder")
         coder.mark_ready()
-        thinking = self.gate.acquire("omlx", "thinking")
-        thinking.mark_ready()
         result = []
-        thread = threading.Thread(
-            target=lambda: result.append(self.gate.acquire("omlx", "heavy-122b"))
-        )
+        thread = threading.Thread(target=lambda: result.append(self.gate.acquire("omlx", "thinking")))
         thread.start()
         self.assertTrue(thread.is_alive())
+        self.assertEqual(self.gate.snapshot()["waiting"], 1)
 
         coder.release()
-        self.assertTrue(thread.is_alive())
-        thinking.release()
         thread.join(timeout=1)
 
         self.assertFalse(thread.is_alive())
+        self.assertEqual(self.gate.snapshot()["waiting"], 0)
         result[0].release()
 
-    def test_exclusive_waiter_blocks_new_light_work(self):
-        coder = self.gate.acquire("omlx", "coder")
-        coder.mark_ready()
-        heavy = []
-        later_light = []
-        heavy_thread = threading.Thread(
-            target=lambda: heavy.append(self.gate.acquire("ds4", "flash"))
-        )
-        light_thread = threading.Thread(
-            target=lambda: later_light.append(self.gate.acquire("omlx", "thinking"))
-        )
-        heavy_thread.start()
-        light_thread.start()
-        self.assertTrue(light_thread.is_alive())
+    def test_another_backend_waits_too(self):
+        first = self.gate.acquire("omlx", "coder")
+        first.mark_ready()
+        result = []
+        thread = threading.Thread(target=lambda: result.append(self.gate.acquire("ds4", "flash")))
+        thread.start()
+        self.assertTrue(thread.is_alive())
 
-        coder.release()
-        heavy_thread.join(timeout=1)
-        self.assertEqual(len(heavy), 1)
-        self.assertTrue(light_thread.is_alive())
-        heavy[0].release()
-        light_thread.join(timeout=1)
-        later_light[0].release()
+        first.release()
+        thread.join(timeout=1)
+
+        self.assertEqual(len(result), 1)
+        result[0].release()
 
     def test_ds4_is_limited_to_one(self):
         first = self.gate.acquire("ds4", "flash")
@@ -388,43 +373,10 @@ class ProcessManagerTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_light_models_load_without_unloading_each_other(self):
+    def test_activating_another_model_unloads_the_first_one(self):
         backends = {
             "omlx": Backend(
                 "omlx", "http://omlx", 1,
-                model_policies={"coder": {"sharing_group": "light"}, "thinking": {"sharing_group": "light"}},
-                load_url="http://omlx/load/{model}",
-                unload_url="http://omlx/unload/{model}",
-            ),
-        }
-        lifecycle = Lifecycle(backends)
-        calls = []
-        lifecycle._post = calls.append
-
-        lifecycle.activate("omlx", "coder", "light")
-        lifecycle.activate("omlx", "thinking", "light")
-
-        self.assertEqual(calls, ["http://omlx/load/coder", "http://omlx/load/thinking"])
-
-    def test_evicted_model_is_loaded_again_after_ttl(self):
-        backends = {
-            "omlx": Backend("omlx", "http://omlx", 1, load_url="http://omlx/load/{model}"),
-        }
-        lifecycle = Lifecycle(backends)
-        calls = []
-        lifecycle._post = calls.append
-
-        lifecycle.activate("omlx", "coder", "light")
-        lifecycle._is_loaded = lambda *_: False
-        lifecycle.activate("omlx", "coder", "light")
-
-        self.assertEqual(calls, ["http://omlx/load/coder", "http://omlx/load/coder"])
-
-    def test_heavy_model_unloads_light_pool_before_loading(self):
-        backends = {
-            "omlx": Backend(
-                "omlx", "http://omlx", 1,
-                model_policies={"coder": {"sharing_group": "light"}},
                 load_url="http://omlx/load/{model}",
                 unload_url="http://omlx/unload/{model}",
             ),
@@ -434,8 +386,8 @@ class LifecycleTests(unittest.TestCase):
         lifecycle._post = calls.append
         lifecycle._is_loaded = lambda *_: True
 
-        lifecycle.activate("omlx", "coder", "light")
-        lifecycle.activate("omlx", "heavy-122b", None)
+        lifecycle.activate("omlx", "coder")
+        lifecycle.activate("omlx", "heavy-122b")
 
         self.assertEqual(calls, [
             "http://omlx/load/coder",
@@ -443,15 +395,29 @@ class LifecycleTests(unittest.TestCase):
             "http://omlx/load/heavy-122b",
         ])
 
+    def test_evicted_model_is_loaded_again_after_ttl(self):
+        backends = {
+            "omlx": Backend("omlx", "http://omlx", 1, load_url="http://omlx/load/{model}"),
+        }
+        lifecycle = Lifecycle(backends)
+        calls = []
+        lifecycle._post = calls.append
+
+        lifecycle.activate("omlx", "coder")
+        lifecycle._is_loaded = lambda *_: False
+        lifecycle.activate("omlx", "coder")
+
+        self.assertEqual(calls, ["http://omlx/load/coder", "http://omlx/load/coder"])
+
     def test_switch_without_unload_hook_fails_closed_for_resident_backend(self):
         backends = {
             "omlx": Backend("omlx", "http://omlx", 1),
             "ds4": Backend("ds4", "http://ds4", 1, requires_unload=False),
         }
         lifecycle = Lifecycle(backends)
-        lifecycle.activate("omlx", "coder", None)
+        lifecycle.activate("omlx", "coder")
         with self.assertRaises(LifecycleError):
-            lifecycle.activate("ds4", "flash", None)
+            lifecycle.activate("ds4", "flash")
 
     def test_ephemeral_ds4_needs_no_unload_hook(self):
         backends = {
@@ -462,8 +428,8 @@ class LifecycleTests(unittest.TestCase):
         calls = []
         lifecycle._post = calls.append
 
-        lifecycle.activate("ds4", "flash", None)
-        lifecycle.activate("omlx", "coder", "light")
+        lifecycle.activate("ds4", "flash")
+        lifecycle.activate("omlx", "coder")
 
         self.assertEqual(calls, ["http://omlx/load/coder"])
 

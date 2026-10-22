@@ -97,7 +97,7 @@ def build_targets(state: dict) -> list[dict]:
                           key=lambda b: b["name"]):
         managed = backend.get("process") is not None
         targets.append({"kind": "backend", "backend": backend["name"], "managed": managed,
-                        "label": f"backend {backend['name']}", "keys": "s r w" + (" K" if backend["name"] == "ds4" else "") if managed else "o"})
+                        "label": f"backend {backend['name']}", "keys": "s K" if managed else "o"})
         for model in backend.get("models", []):
             targets.append({"kind": "model", "backend": backend["name"], "id": model["id"],
                             "label": f"model {model['id'][:30]} ({backend['name']})", "keys": "m"})
@@ -141,12 +141,22 @@ class Actions:
     def warm(self, model: str) -> None:
         self._run(f"warmup {model[:24]}", lambda: self._warm_request(model))
 
-    def restart(self, backend: str, model: str | None) -> None:
+    def restart_gate(self) -> None:
+        """Перезапуск гейта через mgrun: остановка, старт и ожидание /healthz живут там.
+
+        Отдельной сессией: панель не ребёнок гейта и переживёт его, а mgrun
+        пропишет свежий pid-файл, пока панель продолжает опрашивать. Живой
+        запрос при этом обрывается — гейт гасит бэкенды при остановке.
+        """
+        script = Path(__file__).resolve().parents[1] / "mgrun"
+
         def call():
-            post_json(f"{self.gate_url}/admin/stop", {"backend": backend})
-            if model:
-                self._warm_request(model)
-        self._run(f"restart {backend}", call)
+            log = open("/tmp/mgpan-gate-restart.log", "ab", buffering=0)
+            subprocess.Popen([sys.executable, str(script), "--restart-gate"],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+            return "ждём /healthz"
+        self._run("restart gate", call)
 
     def clear_kv(self, backend: str, model: str | None) -> None:
         """Чистка дискового KV-кэша ds4: сервер обязан быть остановлен
@@ -632,7 +642,7 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
         ]
     else:
         active = status.get("active", 0)
-        queue = status.get("waiting_exclusive", 0)
+        queue = status.get("waiting", 0)
         errors = sum(m.get("errors", 0) for m in stats.get("models", {}).values())
         served = sum(m.get("requests", 0) for m in stats.get("models", {}).values())
         # все показатели одной строкой: подписи тусклые, значения цветные
@@ -1007,7 +1017,7 @@ def compact_header_section(state: dict, width: int, sel: dict | None = None) -> 
     )
     prefill = max((m.get("prefill_avg_tps") or m.get("prefill_last_tps") or 0 for m in metrics.values()), default=0)
     active = status.get("active", 0)
-    queue = status.get("waiting_exclusive", 0)
+    queue = status.get("waiting", 0)
     errors = sum(m.get("errors", 0) for m in stats.get("models", {}).values())
     served = sum(m.get("requests", 0) for m in stats.get("models", {}).values())
     info = [[
@@ -1171,9 +1181,10 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
         status += f"poll: {state['poll_error']}"
     hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
     if compact:
-        footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p ↑↓ PgUp c{hint}"
+        footer = f"{'⚡' + status + ' · ' if status else ''}q Q r R p ↑↓ PgUp c{hint}"
     else:
-        footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · ↑/↓ select · PgUp/PgDn log{hint}"
+        footer = (f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart gate"
+                  f" · r reload panel · p pause · ↑/↓ select · PgUp/PgDn log{hint}")
     tty_.paint(lines, footer[:width - 1])
 
 
@@ -1252,17 +1263,6 @@ def main() -> None:
 
             if key == "s" and sel and "s" in sel["keys"]:
                 actions.stop(sel["backend"])
-            elif key == "w" and sel and "w" in sel["keys"]:
-                models = backend_models(sel["backend"])
-                warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")),
-                                  models[0]["id"] if models else None)
-                if warm_model:
-                    actions.warm(warm_model)
-            elif key == "r" and sel and "r" in sel["keys"]:
-                backend = sel["backend"]
-                models = backend_models(backend)
-                warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")), None)
-                actions.restart(backend, warm_model)
             elif key == "m" and sel and "m" in sel["keys"]:
                 actions.switch(sel["id"])
             elif key == "K" and sel and "K" in sel["keys"]:
@@ -1274,9 +1274,16 @@ def main() -> None:
             elif key == "o" and sel and "o" in sel["keys"]:
                 cli = (state.get("omlx") or {}).get("cli_prefix") or "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
                 actions.omlx_restart(cli)
+            elif key == "w":
+                # греть можно только цель local-auto: прогрев другой модели выгрузит её
+                target_model = (state.get("gate_status") or {}).get("selected")
+                if target_model:
+                    actions.warm(target_model)
             elif key == "Q":
                 actions.stop_gate()
             elif key == "R":
+                actions.restart_gate()
+            elif key == "r":
                 restart = True
                 break
             if key == "PgUp":
@@ -1296,7 +1303,7 @@ def main() -> None:
         poller.stop()
 
     if restart:
-        # рестарт только панели (свежий код/палитра), gate не трогать
+        # рестарт только панели (свежий код/палитра); гейт — на R, через mgrun
         os.execv(sys.executable, [sys.executable, sys.argv[0], *sys.argv[1:]])
 
 

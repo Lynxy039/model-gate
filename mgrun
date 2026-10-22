@@ -68,12 +68,36 @@ def start_gate(config: Path) -> subprocess.Popen:
     return process
 
 
+def wait_down(url: str, timeout: float = 120) -> None:
+    """Ждём фактической смерти гейта: при остановке он гасит бэкенды,
+    а ds4-server ещё и сбрасывает резидентный KV-кэш — это десятки секунд."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not gate_alive(url):
+            return
+        time.sleep(0.5)
+    sys.exit(f"gate не умер за {timeout:.0f}s — убей сам: pkill -f 'model_gate --config'")
+
+
+def wait_ready(url: str, process: subprocess.Popen, timeout: float = 60) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if gate_alive(url):
+            return
+        if process.poll() is not None:
+            sys.exit(f"gate умер при старте (code {process.returncode}) — смотри {REPO / 'model-gate.log'}")
+        time.sleep(0.5)
+    sys.exit(f"gate не поднялся за {timeout:.0f}s — смотри {REPO / 'model-gate.log'}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="model-gate + панель одним чохом")
     parser.add_argument("--config", default=str(REPO / "model-gate.json"))
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True,
                         help="GPU%% в панели (sudo powermetrics), по умолчанию вкл; --no-gpu выключает")
     parser.add_argument("--stop", action="store_true", help="остановить gate и выйти")
+    parser.add_argument("--restart-gate", action="store_true",
+                        help="перезапустить gate и выйти (панель на R подключится сама)")
     parser.add_argument("--compact", action="store_true", help="узкий режим панели (боковая панель, телефон)")
     args = parser.parse_args()
     config = Path(args.config)
@@ -83,19 +107,22 @@ def main() -> None:
         stop_gate(url)
         return
 
+    if args.restart_gate:
+        if gate_alive(url):
+            stop_gate(url)
+            wait_down(url)
+        print(f"перезапускаю model-gate ({config})…")
+        process = start_gate(config)
+        wait_ready(url, process)
+        print(f"model-gate поднят на {url}")
+        return
+
     if gate_alive(url):
         print(f"model-gate уже работает на {url} — подключаю панель…")
     else:
         print(f"стартую model-gate ({config})…")
         process = start_gate(config)
-        for _ in range(60):
-            if gate_alive(url):
-                break
-            if process.poll() is not None:
-                sys.exit(f"gate умер при старте (code {process.returncode}) — смотри {REPO / 'model-gate.log'}")
-            time.sleep(0.5)
-        else:
-            sys.exit(f"gate не поднялся за 30s — смотри {REPO / 'model-gate.log'}")
+        wait_ready(url, process)
         print(f"model-gate поднялся на {url}")
 
     # argv[0] — реальный путь: клавиша R в панели перезапускается через execv

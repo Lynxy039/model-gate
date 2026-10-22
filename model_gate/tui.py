@@ -86,7 +86,7 @@ class ModelGateTui:
                     pass
 
         line(0, f"model-gate  {self.url}  |  q: выход  s: остановить", curses.A_BOLD)
-        line(1, f"Активных запросов: {status.get('active', 0)}  |  Ожидают exclusive: {status.get('waiting_exclusive', 0)}")
+        line(1, f"Активных запросов: {status.get('active', 0)}  |  Ожидают допуска: {status.get('waiting', 0)}")
         line(3, "backend     модель                              состояние")
         visible = max(height - 5, 0)
         first = min(max(self.selected - visible // 2, 0), max(len(rows) - visible, 0))
