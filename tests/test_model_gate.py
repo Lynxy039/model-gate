@@ -106,28 +106,17 @@ class ProxyModelDiscoveryTests(unittest.TestCase):
         self.assertEqual(server.backends["omlx"].models, ["new-model"])
         self.assertEqual(server.router.backend_for("new-model"), "omlx")
 
-    def test_model_list_refreshes_and_aggregates_backends(self):
+    def test_model_list_exposes_only_auto_facade(self):
         handler = object.__new__(ProxyHandler)
         handler.path = "/v1/models"
         handler._json = Mock()
-        handler.server = SimpleNamespace(
-            refresh_models=Mock(),
-            backends={
-                "omlx": Backend("omlx", "http://omlx", 1, models=["coder"]),
-                "ds4": Backend("ds4", "http://ds4", 1, models=["flash"]),
-            },
-        )
+        handler.server = SimpleNamespace(resolve_auto=Mock(return_value="glm5.3-flash"))
 
         ProxyHandler.do_GET(handler)
 
-        handler.server.refresh_models.assert_called_once_with()
-        handler._json.assert_called_once_with(200, {
-            "object": "list",
-            "data": [
-                {"id": "coder", "object": "model", "owned_by": "omlx"},
-                {"id": "flash", "object": "model", "owned_by": "ds4"},
-            ],
-        })
+        data = handler._json.call_args[0][1]["data"]
+        self.assertEqual([m["id"] for m in data], ["auto"])
+        self.assertEqual(data[0]["selected"], "glm5.3-flash")
 
     def test_refresh_models_stores_metadata_and_respects_only(self):
         server = object.__new__(GateServer)

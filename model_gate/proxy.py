@@ -388,6 +388,7 @@ class GateServer(ThreadingHTTPServer):
         self._selected_lock = threading.Lock()
         self._selected_file = Path("/tmp/model-gate.selected")
         self.selected = self._load_selected() or str(config.get("auto_model", "")) or None
+        self._last_discovery = 0.0
         self.max_body_bytes = int(config.get("max_body_bytes", 64 * 1024 * 1024))
         self.upstream_timeout = float(config.get("upstream_timeout", 600))
         self.failure_cooldown = float(config.get("lifecycle_failure_cooldown", 5))
@@ -446,6 +447,11 @@ class GateServer(ThreadingHTTPServer):
             self.router = ModelRouter({name: backend.__dict__ for name, backend in self.backends.items()})
 
     def admin_status(self) -> dict[str, object]:
+        # discovery жил за счёт клиентских опросов /v1/models; теперь наружу
+        # торчит только auto — обновляем список моделей попутно, не чаще раза в 15с
+        if time.monotonic() - self._last_discovery > 15:
+            self._last_discovery = time.monotonic()
+            self.refresh_models()
         admission = self.gate.snapshot()
         processes = self.processes.snapshot()
         loaded = self.lifecycle.snapshot()
@@ -503,14 +509,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._json(200, self.server.gate.snapshot())
             return
         if self.path == "/v1/models":
-            self.server.refresh_models()
+            # фасад: наружу торчит только алиас auto — выбор модели живёт в панели
+            # (mgpan), а не в клиентах; реальные модели видны в /<backend>/v1/models
+            selected = self.server.resolve_auto()
             self._json(200, {
                 "object": "list",
-                "data": [
-                    _model_entry(backend, model)
-                    for backend in self.server.backends.values()
-                    for model in sorted(backend.models)
-                ],
+                "data": [{
+                    "id": AUTO_ALIAS, "object": "model", "owned_by": "model-gate",
+                    "max_context_length": 200000,
+                    "selected": selected,
+                }],
             })
             return
         match = BACKEND_V1_RE.match(self.path)
