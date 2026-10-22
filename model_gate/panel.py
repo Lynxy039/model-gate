@@ -88,7 +88,9 @@ def build_targets(state: dict) -> list[dict]:
     for entry in (state.get("gate_stats") or {}).get("inflight", []):
         targets.append({"kind": "inflight", "id": entry["id"], "backend": entry["backend"],
                         "label": f"req #{entry['id']} {entry['model'][:24]} {entry['elapsed_s']:.0f}s", "keys": "x"})
-    for backend in (state.get("gate_status") or {}).get("backends", []):
+    # порядок обхода j/k = порядок отрисовки: боксы отсортированы по имени
+    for backend in sorted((state.get("gate_status") or {}).get("backends", []),
+                          key=lambda b: b["name"]):
         managed = backend.get("process") is not None
         targets.append({"kind": "backend", "backend": backend["name"], "managed": managed,
                         "label": f"backend {backend['name']}", "keys": "s r" if managed else "o"})
@@ -829,22 +831,22 @@ def models_section(state: dict, width: int, compact: bool = False) -> list[list[
         inner.append([("no traffic yet", "dim")])
     elif compact:
         # узкий режим: только главные колонки, модель во всю оставшуюся ширину
-        name_w = max(6, width - 4 - 22)
-        inner.append([(f"{'model':<{name_w}}", "dim"), (f"{'req':>5}", "dim"),
-                      (f"{'in':>6}", "dim"), (f"{'out':>6}", "dim"), (f"{'t/s':>5}", "dim")])
+        name_w = max(6, width - 4 - 26)
+        inner.append([(f"{'model':<{name_w}}", "dim"), (f"{'req':>6}", "dim"),
+                      (f"{'in':>7}", "dim"), (f"{'out':>7}", "dim"), (f"{'t/s':>6}", "dim")])
         for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
             model = models[key]
             avg_tps = model.get("avg_tps")
             short = key.replace("ds4/", "d:").replace("omlx/", "o:")
             role = "ok" if model["errors"] == 0 else "warn"
             inner.append([(f"{short[:name_w]:<{name_w}}", role),
-                          (f"{model['requests']:>5}", "fg"),
-                          (f"{fmt_n(model['prompt_tokens']):>6}", "fg"),
-                          (f"{fmt_n(model['completion_tokens']):>6}", "fg"),
-                          (f"{(f'{avg_tps:.0f}' if avg_tps else '—'):>5}", "orange")])
+                          (f"{model['requests']:>6}", "fg"),
+                          (f"{fmt_n(model['prompt_tokens']):>7}", "fg"),
+                          (f"{fmt_n(model['completion_tokens']):>7}", "fg"),
+                          (f"{(f'{avg_tps:.0f}' if avg_tps else '—'):>6}", "orange")])
     else:
-        inner.append([("model" + " " * 29, "dim"), (f"{'req':>5}", "dim"), (f"{'in':>7}", "dim"),
-                      (f"{'out':>7}", "dim"), (f"{'cache':>6}", "dim"), (f"{'pre t/s':>8}", "dim"),
+        inner.append([("model" + " " * 29, "dim"), (f"{'req':>5}", "dim"), (f"{'in':>8}", "dim"),
+                      (f"{'out':>8}", "dim"), (f"{'cache':>6}", "dim"), (f"{'pre t/s':>8}", "dim"),
                       (f"{'gen t/s':>8}", "dim"), (f"{'last':>7}", "dim")])
         for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
             model = models[key]
@@ -856,8 +858,8 @@ def models_section(state: dict, width: int, compact: bool = False) -> list[list[
             role = "ok" if model["errors"] == 0 else "warn"
             inner.append([(f"{short[:30]:<34}", role),
                           (f"{model['requests']:>5}", "fg"),
-                          (f"{fmt_n(model['prompt_tokens']):>7}", "fg"),
-                          (f"{fmt_n(model['completion_tokens']):>7}", "fg"),
+                          (f"{fmt_n(model['prompt_tokens']):>8}", "fg"),
+                          (f"{fmt_n(model['completion_tokens']):>8}", "fg"),
                           (f"{(f'{cache:.0f}%' if cache is not None else '—'):>6}", "fg"),
                           (f"{(f'{prefill:.0f}' if prefill else '—'):>8}", "orange"),
                           (f"{(f'{avg_tps:.1f}' if avg_tps else '—'):>8}", "fg"),
