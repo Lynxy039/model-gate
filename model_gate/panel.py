@@ -329,6 +329,7 @@ class Poller(threading.Thread):
             "gpu_pct": None, "gpu_watts": None, "sys_watts": None, "gpu_temp": None,
             "gpu_note": "off (--no-gpu)" if not gpu else "",
             "kv_disk": None,
+            "poll_error": "",
             "hist": {k: deque(maxlen=HISTORY) for k in ("cpu", "mem", "pool", "gpu", "watts", "temp")},
             "rates": {"req_min": 0},
         }
@@ -491,54 +492,62 @@ class Poller(threading.Thread):
         while not self._stop.is_set():
             started = time.monotonic()
             try:
-                stats = fetch_json(f"{self.gate_url}/admin/stats")
-                status = fetch_json(f"{self.gate_url}/admin/status")
+                self._sample(cycle)
+            except Exception as error:  # noqa: BLE001 — один неудачный сэмпл не должен вешать опрос:
+                # мёртвый поток = панель навсегда замирает с последней картинкой
                 with self.lock:
-                    self.state["gate_stats"], self.state["gate_status"], self.state["gate_error"] = stats, status, ""
-            except (URLError, OSError, ValueError) as error:
+                    self.state["poll_error"] = f"{type(error).__name__}: {str(error)[:60]}"
+            else:
                 with self.lock:
-                    self.state["gate_error"] = str(error)
-            if cycle % 2 == 0:
-                try:
-                    omlx = fetch_json(f"{self.omlx_url}/admin/api/stats")
-                    with self.lock:
-                        self.state["omlx"], self.state["omlx_error"] = omlx, ""
-                except (URLError, OSError, ValueError):
-                    with self.lock:
-                        self.state["omlx_error"] = "unavailable"
-                try:
-                    with self.lock:
-                        self.state["sys"] = read_vm_stat()
-                        self.state["rss"] = read_process_rss({"ds4": "ds4-server", "omlx": "omlx"})
-                        self.state["hist"]["mem"].append(self.state["sys"].get("mem_frac"))
-                    pool = (self.state.get("omlx") or {}).get("active_models", {})
-                    if pool.get("model_memory_max"):
-                        self.state["hist"]["pool"].append(pool["model_memory_used"] / pool["model_memory_max"])
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    pass
-            if cycle % 3 == 0:  # каталог KV-кэша: путь ловим один раз, размер — периодически
-                try:
-                    if self._kv_dir is None:
-                        self._kv_dir = read_kv_dir()
-                    if self._kv_dir:
-                        path, cap = self._kv_dir
-                        used = dir_size(path)
-                        with self.lock:
-                            self.state["kv_disk"] = {"path": path, "bytes": used, "cap": cap}
-                except OSError:
-                    self._kv_dir = None
-            cpu = read_cpu_busy()
-            with self.lock:
-                self.state["cpu"] = cpu
-                self.state["hist"]["cpu"].append(cpu)
-            sys_watts = self._read_system_watts()
-            if sys_watts is not None:
-                with self.lock:
-                    self.state["hist"]["watts"].append(sys_watts)
-                    self.state["sys_watts"] = sys_watts
-            self._update_rates()
+                    self.state["poll_error"] = ""
             self._stop.wait(max(0.2, 1.1 - (time.monotonic() - started)))
             cycle += 1
+
+    def _sample(self, cycle: int) -> None:
+        try:
+            stats = fetch_json(f"{self.gate_url}/admin/stats")
+            status = fetch_json(f"{self.gate_url}/admin/status")
+            with self.lock:
+                self.state["gate_stats"], self.state["gate_status"], self.state["gate_error"] = stats, status, ""
+        except (URLError, OSError, ValueError) as error:
+            with self.lock:
+                self.state["gate_error"] = str(error)
+        if cycle % 2 == 0:
+            try:
+                omlx = fetch_json(f"{self.omlx_url}/admin/api/stats")
+                with self.lock:
+                    self.state["omlx"], self.state["omlx_error"] = omlx, ""
+            except (URLError, OSError, ValueError):
+                with self.lock:
+                    self.state["omlx_error"] = "unavailable"
+            try:
+                with self.lock:
+                    self.state["sys"] = read_vm_stat()
+                    self.state["rss"] = read_process_rss({"ds4": "ds4-server", "omlx": "omlx"})
+                    self.state["hist"]["mem"].append(self.state["sys"].get("mem_frac"))
+                pool = (self.state.get("omlx") or {}).get("active_models", {})
+                if pool.get("model_memory_max"):
+                    self.state["hist"]["pool"].append(pool["model_memory_used"] / pool["model_memory_max"])
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        if cycle % 3 == 0:  # каталог KV-кэша: путь ловим один раз, размер — периодически
+            if self._kv_dir is None:
+                self._kv_dir = read_kv_dir()
+            if self._kv_dir:
+                path, cap = self._kv_dir
+                used = dir_size(path)
+                with self.lock:
+                    self.state["kv_disk"] = {"path": path, "bytes": used, "cap": cap}
+        cpu = read_cpu_busy()
+        with self.lock:
+            self.state["cpu"] = cpu
+            self.state["hist"]["cpu"].append(cpu)
+        sys_watts = self._read_system_watts()
+        if sys_watts is not None:
+            with self.lock:
+                self.state["hist"]["watts"].append(sys_watts)
+                self.state["sys_watts"] = sys_watts
+        self._update_rates()
 
     def _update_rates(self) -> None:
         stats = self.state.get("gate_stats") or {}
@@ -1146,6 +1155,10 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
     height, width = tty_.size()
     lines = render(state, width - 1, height, sel, compact)[:height - 1]
     status = actions.status() if actions else ""
+    if state.get("poll_error"):
+        # сэмпл упал: показываем причину, иначе панель молча стоит на последней картинке
+        status = f"{status} · " if status else ""
+        status += f"poll: {state['poll_error']}"
     hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
     if compact:
         footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p ↑↓ PgUp c{hint}"
