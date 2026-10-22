@@ -93,12 +93,7 @@ def build_targets(state: dict) -> list[dict]:
                           key=lambda b: b["name"]):
         managed = backend.get("process") is not None
         targets.append({"kind": "backend", "backend": backend["name"], "managed": managed,
-                        "label": f"backend {backend['name']}", "keys": "s r" if managed else "o"})
-        for model in backend.get("models", []):
-            loaded = bool(model.get("loaded") or model.get("running") or model.get("active"))
-            keys = "w" + (" u" if backend["name"] == "omlx" and loaded else "")
-            targets.append({"kind": "model", "backend": backend["name"], "id": model["id"],
-                            "label": f"model {model['id'][:30]} ({backend['name']})", "keys": keys})
+                        "label": f"backend {backend['name']}", "keys": "s r w" if managed else "o"})
     return targets
 
 
@@ -144,11 +139,6 @@ class Actions:
 
     def cancel(self, request_id: int) -> None:
         self._run(f"cancel #{request_id}", lambda: post_json(f"{self.gate_url}/admin/cancel", {"id": request_id}))
-
-    def omlx_unload(self, model_id: str, api_key: str) -> None:
-        url = f"{self.omlx_url}/admin/api/models/{model_id}/unload"
-        self._run(f"unload {model_id[:24]}",
-                  lambda: post_json(url, {}, headers={"Authorization": f"Bearer {api_key}"}))
 
     def omlx_restart(self, cli: str) -> None:
         self._run("omlx restart",
@@ -799,15 +789,12 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
         if not vertical:  # в узком режиме пустая строка между статусом и списком не нужна
             inner.append([("", "")])
         for model in backend.get("models", []):
-            selected = sel and sel["kind"] == "model" and sel["backend"] == name and sel["id"] == model["id"]
             if model.get("active"):
                 role, mark = "live", "▶"
             elif model.get("loaded") or model.get("running"):
                 role, mark = "ok", "◆"
             else:
                 role, mark = "dim", "·"
-            if selected:
-                role, mark = "live", "▸"
             inner.append([(f"{mark} {model['id'][:sub_width - 5]}", role)])
         groups.append((name, inner))
     if not groups:
@@ -1124,9 +1111,9 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
         status = actions.status() if actions else ""
         hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
         if compact:
-            footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p jk PgUp c{hint}"
+            footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p ↑↓ PgUp c{hint}"
         else:
-            footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · j/k select · PgUp/PgDn log{hint}"
+            footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · ↑/↓ select · PgUp/PgDn log{hint}"
     tty_.paint(lines, footer[:width - 1], footer_bold=bool(pending))
 
 
@@ -1211,7 +1198,11 @@ def main() -> None:
                 backend = sel["backend"]
                 pending = (lambda b=backend: actions.stop(b), f"STOP backend {backend} (освободит RAM)")
             elif key == "w" and sel and "w" in sel["keys"]:
-                actions.warm(sel["id"])
+                models = backend_models(sel["backend"])
+                warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")),
+                                  models[0]["id"] if models else None)
+                if warm_model:
+                    actions.warm(warm_model)
             elif key == "r" and sel and "r" in sel["keys"]:
                 backend = sel["backend"]
                 models = backend_models(backend)
@@ -1219,10 +1210,6 @@ def main() -> None:
                 pending = (lambda b=backend, m=warm_model: actions.restart(b, m), f"RESTART backend {backend}")
             elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
-            elif key == "u" and sel and "u" in sel["keys"]:
-                api_key = (state.get("omlx") or {}).get("api_key", "")
-                model_id = sel["id"]
-                pending = (lambda m=model_id, k=api_key: actions.omlx_unload(m, k), f"UNLOAD omlx model {model_id[:34]}")
             elif key == "o" and sel and "o" in sel["keys"]:
                 cli = (state.get("omlx") or {}).get("cli_prefix") or "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
                 pending = (lambda c=cli: actions.omlx_restart(c), "RESTART omlx SERVER (сбросит все модели)")
