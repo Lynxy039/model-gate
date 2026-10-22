@@ -58,6 +58,11 @@ SGR: dict[str, str] = {"": "\x1b[0m"}
 SGR.update({role: ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g};{b}m"
             for role, (r, g, b) in GRUVBOX_RGB.items()})
 
+# Рамка боксов: серый bg3, но зеленеет (как заголовки), когда терминал в фокусе.
+# Фокус панель ловит через DEC 1004 (Ghostty шлёт ESC[I / ESC[O на смену фокуса
+# поверхности), поэтому подсветка именно активного окна, а не гашение прочих.
+BORDER = "border"
+
 LOGO = [
     ("██╗     ", "ok", "██╗  ██╗", "blue"),
     ("██║     ", "ok", "╚██╗██╔╝", "blue"),
@@ -200,6 +205,27 @@ class Actions:
             pid = int(Path(pid_file).read_text().strip())
             os.kill(pid, signal.SIGTERM)
         self._run("stop gate", call)
+
+    def emergency(self) -> None:
+        """Один удар вместо x,x,s: снять живые запросы и погасить бэкенды.
+
+        Отмена идёт первой — нагрузка на GPU падает сразу, а graceful стоп
+        бэкенда ещё и сбрасывает KV на диск десятки секунд.
+        """
+        def call():
+            stats = fetch_json(f"{self.gate_url}/admin/stats")
+            ids = [entry["id"] for entry in stats.get("inflight", [])]
+            for request_id in ids:
+                try:
+                    post_json(f"{self.gate_url}/admin/cancel", {"id": request_id})
+                except Exception:  # noqa: BLE001 — запрос мог уже завершиться
+                    pass
+            status = fetch_json(f"{self.gate_url}/admin/status")
+            stopped = [b["name"] for b in status.get("backends", []) if b.get("process")]
+            for backend in stopped:
+                post_json(f"{self.gate_url}/admin/stop", {"backend": backend})
+            return f"отменено {len(ids)} · остановлен {' '.join(stopped) or '—'}"
+        self._run("emergency", call)
 
 
 def fmt_n(value: float | int | None) -> str:
@@ -581,8 +607,8 @@ class Poller(threading.Thread):
 def box(title: str, inner: list[list[Seg]], width: int) -> list[list[Seg]]:
     inner_width = width - 4
     title = title[:max(0, width - 6)]  # заголовок не должен разрывать рамку
-    lines: list[list[Seg]] = [[("╭─ ", "border"), (title, "head"),
-                               (" " + "─" * max(0, width - len(title) - 5), "border"), ("╮", "border")]]
+    lines: list[list[Seg]] = [[("╭─ ", BORDER), (title, "head"),
+                               (" " + "─" * max(0, width - len(title) - 5), BORDER), ("╮", BORDER)]]
     for segs in inner:
         used = sum(len(text) for text, _ in segs)
         if used > inner_width:  # узкий терминал: режем строку, а не ломаем сетку
@@ -596,8 +622,8 @@ def box(title: str, inner: list[list[Seg]], width: int) -> list[list[Seg]]:
             segs = clipped
             used = inner_width
         pad = max(0, inner_width - used)
-        lines.append([("│ ", "border")] + segs + [(" " * pad, "border"), (" │", "border")])
-    lines.append([("╰" + "─" * (width - 2) + "╯", "border")])
+        lines.append([("│ ", BORDER)] + segs + [(" " * pad, BORDER), (" │", BORDER)])
+    lines.append([("╰" + "─" * (width - 2) + "╯", BORDER)])
     return lines
 
 
@@ -722,11 +748,11 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
     height = max(3 + len(stack), len(logo_inner) + 2)
     right += stack + [[("", "")]] * max(0, height - 3 - len(stack))
     logo_inner += [[]] * (height - 2 - len(logo_inner))
-    logo_box: list[list[Seg]] = [[("╭" + "─" * (LOGO_WIDTH + 2) + "╮", "border")]]
+    logo_box: list[list[Seg]] = [[("╭" + "─" * (LOGO_WIDTH + 2) + "╮", BORDER)]]
     for segs in logo_inner:
         used = sum(len(text) for text, _ in segs)
-        logo_box.append([("│ ", "border")] + segs + [(" " * (LOGO_WIDTH - used), "border"), (" │", "border")])
-    logo_box.append([("╰" + "─" * (LOGO_WIDTH + 2) + "╯", "border")])
+        logo_box.append([("│ ", BORDER)] + segs + [(" " * (LOGO_WIDTH - used), BORDER), (" │", BORDER)])
+    logo_box.append([("╰" + "─" * (LOGO_WIDTH + 2) + "╯", BORDER)])
 
     lines: list[list[Seg]] = []
     for row in range(height):
@@ -1126,12 +1152,13 @@ class Tty:
         self.fd = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
-        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        # 1004 — отчёт о фокусе поверхности: нужен, чтобы красить рамку активного окна
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1004h")
         sys.stdout.flush()
         return self
 
     def __exit__(self, *exc) -> None:
-        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.write("\x1b[0m\x1b[?1004l\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
@@ -1164,7 +1191,8 @@ class Tty:
             return None
         data = os.read(self.fd, 16)
         if data.startswith(b"\x1b["):
-            return {"A": "UP", "B": "DOWN", "5~": "PgUp", "6~": "PgDn"}.get(data[2:].decode("ascii", "ignore"))
+            return {"A": "UP", "B": "DOWN", "5~": "PgUp", "6~": "PgDn",
+                    "I": "FOCUS_IN", "O": "FOCUS_OUT"}.get(data[2:].decode("ascii", "ignore"))
         if data == b"\x1b":
             return "ESC"
         return chr(data[0]) if data else None
@@ -1181,10 +1209,10 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
         status += f"poll: {state['poll_error']}"
     hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
     if compact:
-        footer = f"{'⚡' + status + ' · ' if status else ''}q Q r R p ↑↓ PgUp c{hint}"
+        footer = f"{'⚡' + status + ' · ' if status else ''}q Q X r R p ↑↓ PgUp c{hint}"
     else:
         footer = (f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart gate"
-                  f" · r reload panel · p pause · ↑/↓ select · PgUp/PgDn log{hint}")
+                  f" · r reload · X kill load · p pause · ↑/↓ select · PgUp/PgDn log{hint}")
     tty_.paint(lines, footer[:width - 1])
 
 
@@ -1193,6 +1221,7 @@ def flatten(segs: list[Seg]) -> str:
 
 
 def main() -> None:
+    global BORDER
     parser = argparse.ArgumentParser(description="model-gate monitoring panel")
     parser.add_argument("--url", default=os.environ.get("MODEL_GATE_URL", "http://127.0.0.1:9000"))
     parser.add_argument("--omlx-url", default="http://127.0.0.1:8001")
@@ -1230,6 +1259,7 @@ def main() -> None:
 
     actions = Actions(args.url, args.omlx_url)
     paused, scroll, sel_index, restart = False, 0, 0, False
+    focused = True  # DEC 1004 приходит только на смене фокуса — стартуем «в фокусе»
     with Tty() as tty_:
         compact = args.compact or tty_.size()[1] < 80
         prev_width = tty_.size()[1]
@@ -1244,6 +1274,11 @@ def main() -> None:
                     compact = width < 80
             if key in ("q", "ESC"):
                 break
+            if key == "FOCUS_IN":
+                focused = True
+            elif key == "FOCUS_OUT":
+                focused = False
+            BORDER = "head" if focused else "border"
             if key == "p":
                 paused = not paused
             if key == "c":
@@ -1279,6 +1314,8 @@ def main() -> None:
                 target_model = (state.get("gate_status") or {}).get("selected")
                 if target_model:
                     actions.warm(target_model)
+            elif key == "X":
+                actions.emergency()
             elif key == "Q":
                 actions.stop_gate()
             elif key == "R":
