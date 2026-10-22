@@ -138,9 +138,11 @@ class Actions:
         self._run(f"warmup {model[:24]}", lambda: self._warm_request(model))
 
     def restart(self, backend: str, model: str | None) -> None:
-        self.stop(backend)
-        if model:
-            self.warm(model)
+        def call():
+            post_json(f"{self.gate_url}/admin/stop", {"backend": backend})
+            if model:
+                self._warm_request(model)
+        self._run(f"restart {backend}", call)
 
     def switch(self, model: str) -> None:
         def call():
@@ -1118,22 +1120,16 @@ class Tty:
 
 
 def draw(tty_: Tty, state: dict, sel: dict | None = None,
-         actions: "Actions | None" = None, pending: tuple | None = None,
-         compact: bool = False) -> None:
+         actions: "Actions | None" = None, compact: bool = False) -> None:
     height, width = tty_.size()
     lines = render(state, width - 1, height, sel, compact)[:height - 1]
-    if pending:
-        # подтверждение в начале строки: в узком режиме длинное описание не
-        # должно отрезать единственную подсказку, что именно нужно нажать.
-        footer = f" y=confirm n=cancel · {pending[1]} "
+    status = actions.status() if actions else ""
+    hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
+    if compact:
+        footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p ↑↓ PgUp c{hint}"
     else:
-        status = actions.status() if actions else ""
-        hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
-        if compact:
-            footer = f"{'⚡' + status + ' · ' if status else ''}q Q R p ↑↓ PgUp c{hint}"
-        else:
-            footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · ↑/↓ select · PgUp/PgDn log{hint}"
-    tty_.paint(lines, footer[:width - 1], footer_bold=bool(pending))
+        footer = f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart panel · p pause · ↑/↓ select · PgUp/PgDn log{hint}"
+    tty_.paint(lines, footer[:width - 1])
 
 
 def flatten(segs: list[Seg]) -> str:
@@ -1177,7 +1173,7 @@ def main() -> None:
         return
 
     actions = Actions(args.url, args.omlx_url)
-    paused, scroll, sel_index, pending, restart = False, 0, 0, None, False
+    paused, scroll, sel_index, restart = False, 0, 0, False
     with Tty() as tty_:
         compact = args.compact or tty_.size()[1] < 80
         prev_width = tty_.size()[1]
@@ -1209,16 +1205,8 @@ def main() -> None:
                         return entry.get("models", [])
                 return []
 
-            if pending:
-                if key == "y":
-                    pending[0]()
-                    pending = None
-                elif key in ("n", "ESC"):
-                    pending = None
-                # остальные клавиши игнорируются, запрос подтверждения остаётся
-            elif key == "s" and sel and "s" in sel["keys"]:
-                backend = sel["backend"]
-                pending = (lambda b=backend: actions.stop(b), f"STOP backend {backend} (освободит RAM)")
+            if key == "s" and sel and "s" in sel["keys"]:
+                actions.stop(sel["backend"])
             elif key == "w" and sel and "w" in sel["keys"]:
                 models = backend_models(sel["backend"])
                 warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")),
@@ -1229,16 +1217,16 @@ def main() -> None:
                 backend = sel["backend"]
                 models = backend_models(backend)
                 warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")), None)
-                pending = (lambda b=backend, m=warm_model: actions.restart(b, m), f"RESTART backend {backend}")
+                actions.restart(backend, warm_model)
             elif key == "m" and sel and "m" in sel["keys"]:
-                pending = (lambda m=sel["id"]: actions.switch(m), f"SWITCH local-auto -> {sel['id'][:34]} (остановит текущую модель ds4)")
+                actions.switch(sel["id"])
             elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
             elif key == "o" and sel and "o" in sel["keys"]:
                 cli = (state.get("omlx") or {}).get("cli_prefix") or "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
-                pending = (lambda c=cli: actions.omlx_restart(c), "RESTART omlx SERVER (сбросит все модели)")
+                actions.omlx_restart(cli)
             elif key == "Q":
-                pending = (actions.stop_gate, "STOP model-gate (все ds4-серверы умрут)")
+                actions.stop_gate()
             elif key == "R":
                 restart = True
                 break
@@ -1255,7 +1243,7 @@ def main() -> None:
             sel = targets[sel_index] if targets else None
             if not paused:
                 state["_recent_view"] = recent[scroll:]
-                draw(tty_, state, sel, actions, pending, compact)
+                draw(tty_, state, sel, actions, compact)
         poller.stop()
 
     if restart:
