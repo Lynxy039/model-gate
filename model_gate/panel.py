@@ -255,6 +255,35 @@ def read_process_rss(patterns: dict[str, str]) -> dict[str, int]:
     return result
 
 
+def read_kv_dir() -> tuple[str, int] | None:
+    """--kv-disk-dir и лимит из командной строки живого ds4-server."""
+    raw = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
+    for line in raw.splitlines():
+        cmd = line.strip()
+        # бинарник обязан стоять в начале ps-строки (реальный запуск), иначе
+        # поймаем любой процесс, у которого этот текст затесался в аргументах
+        if not cmd.startswith("/") or "/ds4-server" not in cmd.split(" ", 1)[0]:
+            continue
+        match = re.search(r"--kv-disk-dir (\S+)", cmd)
+        if not match:
+            continue
+        cap = re.search(r"--kv-disk-space-mb (\d+)", cmd)
+        return match.group(1), int(cap.group(1)) * 1024 * 1024 if cap else None
+    return None
+
+
+def dir_size(path: str) -> int:
+    total = 0
+    with os.scandir(path) as entries:
+        for entry in entries:
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+    return total
+
+
 # ---------------------------------------------------------------- poller
 
 class Poller(threading.Thread):
@@ -270,11 +299,13 @@ class Poller(threading.Thread):
             "sys": {}, "rss": {}, "cpu": None,
             "gpu_pct": None, "gpu_watts": None, "sys_watts": None, "gpu_temp": None,
             "gpu_note": "off (--no-gpu)" if not gpu else "",
+            "kv_disk": None,
             "hist": {k: deque(maxlen=HISTORY) for k in ("cpu", "mem", "pool", "gpu", "watts", "temp")},
             "rates": {"req_min": 0},
         }
         self._gpu_proc: subprocess.Popen | None = None
         self._gpu_log = None
+        self._kv_dir: tuple[str, int] | None = None
         self._stop = threading.Event()
 
     def _start_gpu(self) -> None:
@@ -456,6 +487,17 @@ class Poller(threading.Thread):
                         self.state["hist"]["pool"].append(pool["model_memory_used"] / pool["model_memory_max"])
                 except (OSError, ValueError, subprocess.SubprocessError):
                     pass
+            if cycle % 3 == 0:  # каталог KV-кэша: путь ловим один раз, размер — периодически
+                try:
+                    if self._kv_dir is None:
+                        self._kv_dir = read_kv_dir()
+                    if self._kv_dir:
+                        path, cap = self._kv_dir
+                        used = dir_size(path)
+                        with self.lock:
+                            self.state["kv_disk"] = {"path": path, "bytes": used, "cap": cap}
+                except OSError:
+                    self._kv_dir = None
             cpu = read_cpu_busy()
             with self.lock:
                 self.state["cpu"] = cpu
@@ -549,12 +591,16 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
     else:
         active = status.get("active", 0)
         queue = status.get("waiting_exclusive", 0)
+        errors = sum(m.get("errors", 0) for m in stats.get("models", {}).values())
+        served = sum(m.get("requests", 0) for m in stats.get("models", {}).values())
         # все показатели одной строкой: подписи тусклые, значения цветные
         info = [[
             ("up ", "dim"), (fmt_g(stats.get("uptime_s")), "fg"),
             (" · ", "dim"), ("active ", "dim"), (str(active), "live" if active else "dim"),
             (" · ", "dim"), ("queue ", "dim"), (str(queue), "warn" if queue else "dim"),
             (" · ", "dim"), (f"{state['rates']['req_min']} req/min", "blue"),
+            (" · ", "dim"), ("err ", "dim"),
+            (f"{errors}/{served}", "err" if errors else "dim"),
             (" · ", "dim"), ("gen ", "dim"), (f"{live_tps:.1f} t/s", "orange"),
             (" · ", "dim"), ("pre ", "dim"), (f"{prefill:.0f} t/s", "orange"),
             (" · ", "dim"), (f"{datetime.now():%H:%M:%S}", "dim"),
@@ -729,13 +775,25 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
                       for key, m in stats.get("models", {}).items() if key.startswith(name + "/")]
             prompt = sum(p for p, _ in totals)
             cached = sum(c for _, c in totals)
-            tail = []
+            tail: list[Seg] = []
             if prompt:
-                tail.append(f"cache {100 * cached / prompt:.0f}%")
+                tail.append((f"cache {100 * cached / prompt:.0f}%", "dim"))
+            # KV-кэш на диске — добро ds4; предупреждаем, когда каталог подпёр к лимиту
+            kv = state.get("kv_disk") or {} if name == "ds4" else {}
+            if kv.get("bytes") is not None:
+                used_g = kv["bytes"] / 2**30
+                cap_g = kv["cap"] / 2**30 if kv.get("cap") else None
+                text = f"kv {used_g:.0f}/{cap_g:.0f}G" if cap_g else f"kv {used_g:.0f}G"
+                tail.append((text, "warn" if cap_g and used_g >= 0.9 * cap_g else "blue"))
             if process.get("started_ts"):
-                tail.append(f"up {fmt_g(now - process['started_ts'])}")
+                tail.append((f"up {fmt_g(now - process['started_ts'])}", "dim"))
             if tail:
-                inner.append([(" · ".join(tail), "dim")])
+                line: list[Seg] = []
+                for index, (text, role) in enumerate(tail):
+                    if index:
+                        line.append((" · ", "dim"))
+                    line.append((text, role))
+                inner.append(line)
         if not vertical:  # в узком режиме пустая строка между статусом и списком не нужна
             inner.append([("", "")])
         for model in backend.get("models", []):
@@ -817,9 +875,10 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
     if compact:
         # без колонки статуса: имя модели зелёное при 200, красное при ошибке;
         # dur убран — cache-хит по каждому запросу важнее длительности
-        name_w = max(6, width - 4 - 28)
+        name_w = max(6, width - 4 - 34)
         inner.append([(f"{'hh:mm':<6}", "dim"), (f"{'model':<{name_w}}", "dim"),
-                      (f"{'cache':>5}", "live"), (f"{'out':>6}", "blue"),
+                      (f"{'cache':>5}", "live"), (f"{'ttft':>6}", "dim"),
+                      (f"{'out':>6}", "blue"),
                       (f"{'t/s':>5}", "orange"), (f"{'pre':>6}", "orange")])
         for record in recent:
             stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M")
@@ -833,9 +892,11 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
             prefill = f"{record['prefill_tps']:.0f}" if record.get("prefill_tps") else "—"
             prompt, cached = record.get("prompt_tokens") or 0, record.get("cached_tokens") or 0
             reuse = f"{100 * cached / prompt:.0f}%" if prompt and cached else "—"
+            ttft = record.get("ttft_s")
             inner.append([(f"{stamp:<6}", "dim"),
                           (f"{record['model'][:name_w]:<{name_w}}", role),
                           (f"{reuse:>5}", "live"),
+                          (f"{(f'{ttft:.1f}s' if ttft else '—'):>6}", "dim"),
                           (f"{fmt_n(record['completion_tokens']):>6}", "blue"),
                           (f"{tps:>5}", "orange"),
                           (f"{prefill:>6}", "orange")])
@@ -845,7 +906,8 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
     # колонки: каждая своим цветом — время тусклое, модель обычная, статус
     # по результату, токены синие, кэш розовый, скорости оранжевые
     inner.append([(f"{'time':<9}", "dim"), (f" {'model':<24}", "dim"), (" " + f"{'code':>4}", "dim"),
-                  (" " + f"{'dur':>7}", "dim"), (f" {'in':>7}", "blue"), (f" {'out':>6}", "blue"),
+                  (" " + f"{'dur':>7}", "dim"), (" " + f"{'ttft':>5}", "dim"),
+                  (f" {'in':>7}", "blue"), (f" {'out':>6}", "blue"),
                   (f" {'cache':>6}", "live"), (" " + f"{'gen t/s':>8}", "orange"), (f" {'pre t/s':>8}", "orange")])
     for record in recent:
         stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M:%S")
@@ -859,10 +921,14 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
         prefill = f"{record['prefill_tps']:.0f}" if record.get("prefill_tps") else "—"
         prompt, cached = record.get("prompt_tokens") or 0, record.get("cached_tokens") or 0
         reuse = f"{100 * cached / prompt:.0f}%" if prompt and cached else "—"
+        ttft = record.get("ttft_s")
+        # ttft подсвечиваем по факту отзывчивости: зелёный <1с, янтарный <3с
+        ttft_role = "dim" if ttft is None else "ok" if ttft < 1 else "orange" if ttft < 3 else "warn"
         inner.append([(f"{stamp:<9}", "dim"),
                       (f" {record['model'][:24]:<24}", "fg"),
                       (f"{flag:>5}", role),
                       (f" {record['elapsed_s']:>6.2f}s", "fg"),
+                      (f" {(f'{ttft:.2f}s' if ttft else '—'):>5}", ttft_role),
                       (f" {fmt_n(record['prompt_tokens']):>7}", "blue"),
                       (f" {fmt_n(record['completion_tokens']):>6}", "blue"),
                       (f" {reuse:>6}", "live"),
@@ -893,11 +959,14 @@ def compact_header_section(state: dict, width: int, sel: dict | None = None) -> 
     prefill = max((m.get("prefill_avg_tps") or m.get("prefill_last_tps") or 0 for m in metrics.values()), default=0)
     active = status.get("active", 0)
     queue = status.get("waiting_exclusive", 0)
+    errors = sum(m.get("errors", 0) for m in stats.get("models", {}).values())
+    served = sum(m.get("requests", 0) for m in stats.get("models", {}).values())
     info = [[
         (f"up {fmt_g(stats.get('uptime_s'))}", "fg"), (" · ", "dim"),
         (str(active), "live" if active else "dim"), ("act", "dim"), (" · ", "dim"),
         (str(queue), "warn" if queue else "dim"), ("q", "dim"), (" · ", "dim"),
-        (f"{state['rates']['req_min']}/min", "blue"),
+        (f"{state['rates']['req_min']}/min", "blue"), (" · ", "dim"),
+        (f"{errors}err", "err" if errors else "dim"), (f"/{served}", "dim"),
     ]]
     watts = state.get("sys_watts")
     gpu_pct = state.get("gpu_pct")
