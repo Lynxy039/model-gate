@@ -34,44 +34,114 @@ EIGHTHS = " ▁▂▃▄▅▆▇█"
 HISTORY = 150
 CHART_ROWS = 4
 
-GRUVBOX_RGB = {
-    # палитра gruvbox material — truecolor-значения, не зависят от терминала
-    "fg":     (0xEB, 0xDB, 0xB2),   # fg1
-    "dim":    (0x92, 0x83, 0x74),   # gray
-    "border": (0x66, 0x5C, 0x54),   # bg3 — рамки как в футере Pi
-    "ok":     (0xB8, 0xBB, 0x26),   # green
-    "err":    (0xFB, 0x49, 0x34),   # red
-    "warn":   (0xFE, 0x80, 0x19),   # orange
-    "orange": (0xFA, 0xBD, 0x2F),   # yellow — скорости
-    "head":   (0x8E, 0xC0, 0x7C),   # aqua
-    "live":   (0xD3, 0x86, 0x9B),   # purple
-    "blue":   (0x83, 0xA5, 0x98),   # blue
-    # цель local-auto: янтарный, жирный если модель ещё и загружена
-    "sel":    (0xFA, 0xBD, 0x2F),   # yellow
-    "sel_on": (0xFA, 0xBD, 0x2F),   # yellow + bold
-    "cursor": (0xEB, 0xDB, 0xB2),   # fg1 — каретка видна на строке любого цвета
+# Палитры. Имена ролей одинаковы во всех темах — различаются только hex'ы.
+# Роль описывает смысл, а не цвет: sel/sel_on — цель local-auto, live — живой
+# запрос, head — заголовки (и рамка активного окна), border — рамки вне фокуса.
+THEMES: dict[str, dict[str, tuple[int, int, int]]] = {
+    "gruvbox": {  # gruvbox material
+        "fg": (0xEB, 0xDB, 0xB2), "dim": (0x92, 0x83, 0x74), "border": (0x66, 0x5C, 0x54),
+        "ok": (0xB8, 0xBB, 0x26), "err": (0xFB, 0x49, 0x34), "warn": (0xFE, 0x80, 0x19),
+        "orange": (0xFA, 0xBD, 0x2F), "head": (0x8E, 0xC0, 0x7C), "live": (0xD3, 0x86, 0x9B),
+        "blue": (0x83, 0xA5, 0x98), "sel": (0xFA, 0xBD, 0x2F), "sel_on": (0xFA, 0xBD, 0x2F),
+        "cursor": (0xEB, 0xDB, 0xB2),
+    },
+    "catppuccin": {  # catppuccin mocha
+        "fg": (0xCD, 0xD6, 0xF4), "dim": (0xA6, 0xAD, 0xC8), "border": (0x45, 0x47, 0x5A),
+        "ok": (0xA6, 0xE3, 0xA1), "err": (0xF3, 0x8B, 0xA8), "warn": (0xFA, 0xB3, 0x87),
+        "orange": (0xF9, 0xE2, 0xAF), "head": (0x89, 0xDB, 0xEB), "live": (0xCB, 0xA6, 0xF7),
+        "blue": (0x89, 0xB4, 0xFA), "sel": (0xF9, 0xE2, 0xAF), "sel_on": (0xF9, 0xE2, 0xAF),
+        "cursor": (0xCD, 0xD6, 0xF4),
+    },
+    "tokyo-night": {
+        "fg": (0xA9, 0xB1, 0xD6), "dim": (0x56, 0x5F, 0x89), "border": (0x3B, 0x42, 0x61),
+        "ok": (0x9E, 0xCE, 0x6A), "err": (0xF7, 0x76, 0x8E), "warn": (0xFF, 0x9E, 0x64),
+        "orange": (0xE0, 0xAF, 0x68), "head": (0x2A, 0xC3, 0xDE), "live": (0xBB, 0x9A, 0xF7),
+        "blue": (0x7A, 0xA2, 0xF7), "sel": (0xE0, 0xAF, 0x68), "sel_on": (0xE0, 0xAF, 0x68),
+        "cursor": (0xC0, 0xCA, 0xF5),
+    },
+    "nord": {
+        "fg": (0xEC, 0xEF, 0xF4), "dim": (0x8F, 0xA1, 0xB3), "border": (0x4C, 0x56, 0x6A),
+        "ok": (0xA3, 0xBE, 0x8C), "err": (0xBF, 0x61, 0x6A), "warn": (0xD0, 0x87, 0x70),
+        "orange": (0xEB, 0xCB, 0x8B), "head": (0x88, 0xC0, 0xD0), "live": (0xB4, 0x8E, 0xAD),
+        "blue": (0x81, 0xA1, 0xC1), "sel": (0xEB, 0xCB, 0x8B), "sel_on": (0xEB, 0xCB, 0x8B),
+        "cursor": (0xEC, 0xEF, 0xF4),
+    },
+    "dracula": {
+        "fg": (0xF8, 0xF8, 0xF2), "dim": (0x62, 0x72, 0xA4), "border": (0x44, 0x47, 0x5A),
+        "ok": (0x50, 0xFA, 0x7B), "err": (0xFF, 0x55, 0x55), "warn": (0xFF, 0xB8, 0x6C),
+        "orange": (0xF1, 0xFA, 0x8C), "head": (0x8B, 0xE9, 0xFD), "live": (0xFF, 0x79, 0xC6),
+        "blue": (0xBD, 0x93, 0xF9), "sel": (0xF1, 0xFA, 0x8C), "sel_on": (0xF1, 0xFA, 0x8C),
+        "cursor": (0xF8, 0xF8, 0xF2),
+    },
 }
+DEFAULT_THEME = "gruvbox"
+THEME_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "mgpan" / "theme"
+
+# Жирными пишутся роли, которые должны выделяться на фоне соседних строк
 BOLD_ROLES = ("head", "live", "sel_on", "cursor")
+
 # truecolor SGR: ncurses на macOS truecolor не умеет (нет setrgb в terminfo),
 # поэтому рендер — raw ANSI, как у Pi; цвета не зависят от палитры терминала
 SGR: dict[str, str] = {"": "\x1b[0m"}
-SGR.update({role: ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g};{b}m"
-            for role, (r, g, b) in GRUVBOX_RGB.items()})
+THEME = ""
+
+
+def apply_theme(name: str) -> str:
+    """Палитру — в SGR-последовательности. Неизвестное имя игнорируется."""
+    global THEME
+    palette = THEMES.get(name)
+    if palette is None:
+        return THEME
+    THEME = name
+    SGR.clear()
+    SGR[""] = "\x1b[0m"
+    SGR.update({role: ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g};{b}m"
+                for role, (r, g, b) in palette.items()})
+    return THEME
+
+
+def next_theme() -> str:
+    names = list(THEMES)
+    return names[(names.index(THEME) + 1) % len(names)]
+
+
+def load_theme() -> str:
+    """Тема из ~/.config/mgpan/theme; нет файла или неизвестное имя — дефолт."""
+    try:
+        name = THEME_PATH.read_text().strip()
+    except OSError:
+        return DEFAULT_THEME
+    return name if name in THEMES else DEFAULT_THEME
+
+
+def save_theme(name: str) -> None:
+    """Сохранение не критично: read-only HOME не должен ронять панель."""
+    try:
+        THEME_PATH.parent.mkdir(parents=True, exist_ok=True)
+        THEME_PATH.write_text(name + "\n")
+    except OSError:
+        pass
+
+
+apply_theme(load_theme())
 
 # Рамка боксов: серый bg3, но зеленеет (как заголовки), когда терминал в фокусе.
 # Фокус панель ловит через DEC 1004 (Ghostty шлёт ESC[I / ESC[O на смену фокуса
 # поверхности), поэтому подсветка именно активного окна, а не гашение прочих.
 BORDER = "border"
 
+# Канонические глифы ANSI Shadow: M — две вертикальные стойки с V между ними
+# (наклонные стойки читаются как X), G — с левой стойкой и внутренним выступом
+# (без них буква превращается в E). Между буквами зазор в 1 символ.
 LOGO = [
-    ("██╗  ██╗", "ok", "███████╗", "blue"),
-    ("╚██╗██╔╝", "ok", "██╔════╝", "blue"),
-    (" ╚███╔╝ ", "blue", "╚█████╗ ", "warn"),
-    (" ██╔██╗ ", "blue", "██╔══╝  ", "warn"),
-    ("██╔╝ ██╗", "warn", "╚██████╗", "ok"),
-    ("╚═╝  ╚═╝", "dim", " ╚═════╝", "ok"),
+    ("███╗   ███╗", "ok",   "  ██████╗", "blue"),
+    ("████╗ ████║", "ok",   " ██╔════╝", "blue"),
+    ("██╔████╔██║", "blue", " ██║  ███╗", "warn"),
+    ("██║╚██╔╝██║", "blue", " ██║   ██║", "warn"),
+    ("██║ ╚═╝ ██║", "warn", " ╚██████╔╝", "ok"),
+    ("╚═╝     ╚═╝", "dim",  "  ╚═════╝", "ok"),
 ]
-LOGO_WIDTH = 16
+LOGO_WIDTH = 21
 
 Seg = tuple[str, str]
 
@@ -125,6 +195,10 @@ class Actions:
     def status(self) -> str:
         with self.lock:
             return self._status if time.monotonic() < self._expires else ""
+
+    def note(self, text: str) -> None:
+        """Сообщение в футер без запроса к бэкенду (локальное действие панели)."""
+        self._set(text)
 
     def _run(self, label: str, call) -> None:
         def worker():
@@ -1209,10 +1283,10 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
         status += f"poll: {state['poll_error']}"
     hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
     if compact:
-        footer = f"{'⚡' + status + ' · ' if status else ''}q Q X r R p ↑↓ PgUp c{hint}"
+        footer = f"{'⚡' + status + ' · ' if status else ''}q Q X r R p T ↑↓ PgUp c{hint}"
     else:
         footer = (f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart gate"
-                  f" · r reload · X kill load · p pause · ↑/↓ select · PgUp/PgDn log{hint}")
+                  f" · r reload · X kill load · p pause · T theme · ↑/↓ select · PgUp/PgDn log{hint}")
     tty_.paint(lines, footer[:width - 1])
 
 
@@ -1230,7 +1304,11 @@ def main() -> None:
     parser.add_argument("--compact", action="store_true",
                         help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
     parser.add_argument("--once", action="store_true", help="single frame to stdout, no TUI")
+    parser.add_argument("--theme", default="",
+                        help=f"палитра ({', '.join(THEMES)}); по умолчанию — последняя выбранная по T")
     args = parser.parse_args()
+    if args.theme:
+        apply_theme(args.theme)
 
     if args.gpu:
         # NOPASSWD-правило в sudoers (см. README) отбывает здесь же; без него — как раньше
@@ -1283,6 +1361,11 @@ def main() -> None:
                 paused = not paused
             if key == "c":
                 compact = not compact
+            if key == "T":
+                # тема переключается на месте: палитра уходит в SGR, выбор — в файл,
+                # чтобы пережитить и `r` (execv), и следующий запуск панели
+                save_theme(apply_theme(next_theme()))
+                actions.note(f"theme: {THEME}")
             with poller.lock:
                 state = dict(poller.state)
                 recent = list((state.get("gate_stats") or {}).get("recent", []))

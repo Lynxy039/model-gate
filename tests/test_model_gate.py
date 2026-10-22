@@ -1,11 +1,14 @@
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import URLError
 
 from model_gate.gate import AdmissionGate, AdmissionPolicy
+from model_gate import panel
 from model_gate.panel import Actions
 from model_gate.proxy import Backend, GateServer, Lifecycle, LifecycleError, ProcessManager, ProxyHandler
 from model_gate.router import ModelRouter
@@ -250,6 +253,47 @@ class PanelActionTests(unittest.TestCase):
             }),
         ])
         self.assertTrue(actions.status().endswith(": ok"))
+
+
+class PanelThemeTests(unittest.TestCase):
+    def test_every_theme_defines_the_same_roles(self):
+        base = set(panel.THEMES[panel.DEFAULT_THEME])
+        for name, palette in panel.THEMES.items():
+            self.assertEqual(set(palette), base, name)
+            for role, rgb in palette.items():
+                self.assertEqual(len(rgb), 3, f"{name}/{role}")
+                self.assertTrue(all(0 <= v <= 255 for v in rgb), f"{name}/{role}")
+
+    def test_apply_theme_rebuilds_sgr_and_ignores_unknown_name(self):
+        original = panel.THEME
+        try:
+            for name in panel.THEMES:
+                self.assertEqual(panel.apply_theme(name), name)
+                self.assertEqual(set(panel.SGR) - {""}, set(panel.THEMES[name]))
+            self.assertEqual(panel.apply_theme("tokyo-night"), "tokyo-night")
+            # неизвестное имя не должно трогать текущую палитру
+            self.assertEqual(panel.apply_theme("нет-такой"), "tokyo-night")
+            self.assertEqual(set(panel.SGR) - {""}, set(panel.THEMES["tokyo-night"]))
+        finally:
+            panel.apply_theme(original)
+
+    def test_next_theme_walks_the_whole_list_and_wraps(self):
+        original = panel.THEME
+        try:
+            panel.apply_theme(panel.DEFAULT_THEME)
+            seen = [panel.apply_theme(panel.next_theme()) for _ in range(len(panel.THEMES))]
+            self.assertEqual(sorted(seen), sorted(panel.THEMES))
+        finally:
+            panel.apply_theme(original)
+
+    def test_saved_theme_is_reused_and_garbage_falls_back_to_default(self):
+        original = panel.THEME
+        with tempfile.TemporaryDirectory() as tmp, patch.object(panel, "THEME_PATH", Path(tmp) / "theme"):
+            panel.save_theme("nord")
+            self.assertEqual(panel.load_theme(), "nord")
+            panel.THEME_PATH.write_text("розовый\n")
+            self.assertEqual(panel.load_theme(), panel.DEFAULT_THEME)
+            panel.apply_theme(original)
 
 
 class ProxyStreamingTests(unittest.TestCase):
