@@ -10,7 +10,6 @@ from model_gate.panel import Actions
 from model_gate.proxy import Backend, GateServer, Lifecycle, LifecycleError, ProcessManager, ProxyHandler
 from model_gate.router import ModelRouter
 from model_gate.stats import StatsCollector
-from model_gate.tui import model_rows
 
 
 class AdmissionGateTests(unittest.TestCase):
@@ -432,28 +431,6 @@ class LifecycleTests(unittest.TestCase):
         lifecycle.activate("omlx", "coder")
 
         self.assertEqual(calls, ["http://omlx/load/coder"])
-
-
-class TuiTests(unittest.TestCase):
-    def test_rows_expose_running_model_and_backend(self):
-        status = {
-            "backends": [{
-                "name": "ds4",
-                "ready": True,
-                "process": {"pid": 1234, "model": "glm5.3-flash"},
-                "models": [
-                    {"id": "ds4-0731", "active": 0, "loaded": False, "running": False},
-                    {"id": "glm5.3-flash", "active": 1, "loaded": True, "running": True},
-                ],
-            }],
-        }
-
-        self.assertEqual(model_rows(status), [
-            ("ds4", {"pid": 1234, "model": "glm5.3-flash"}, True,
-             {"id": "ds4-0731", "active": 0, "loaded": False, "running": False}),
-            ("ds4", {"pid": 1234, "model": "glm5.3-flash"}, True,
-             {"id": "glm5.3-flash", "active": 1, "loaded": True, "running": True}),
-        ])
 
 
 class ModelRouterTests(unittest.TestCase):

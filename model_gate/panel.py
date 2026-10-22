@@ -1,6 +1,6 @@
 """mgpan — цветная TUI-панель мониторинга model-gate (raw ANSI, без зависимостей).
 
-Gruvbox, логотип lynxy-dev, боксы: header+LIVE, SYSTEM (подбоксы RAM|GPU|CPU
+Gruvbox, лого MG, боксы: header+LIVE, SYSTEM (подбоксы RAM|GPU|CPU
 с многоуровневыми графиками), BACKENDS (модели и метрики провайдеров),
 МОДЕЛИ, RECENT. Источники: gate /admin/stats + /admin/status,
 omlx /admin/api/stats, vm_stat/top/sysctl, опционально sudo powermetrics.
@@ -35,7 +35,7 @@ HISTORY = 150
 CHART_ROWS = 4
 
 GRUVBOX_RGB = {
-    # палитра темы lynxy-dev (gruvbox material) — цвета один в один с Pi
+    # палитра gruvbox material — truecolor-значения, не зависят от терминала
     "fg":     (0xEB, 0xDB, 0xB2),   # fg1
     "dim":    (0x92, 0x83, 0x74),   # gray
     "border": (0x66, 0x5C, 0x54),   # bg3 — рамки как в футере Pi
@@ -64,12 +64,12 @@ SGR.update({role: ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g
 BORDER = "border"
 
 LOGO = [
-    ("██╗     ", "ok", "██╗  ██╗", "blue"),
-    ("██║     ", "ok", "╚██╗██╔╝", "blue"),
-    ("██║      ", "blue", "╚███╔╝", "warn"),
-    ("██║      ", "blue", "██╔██╗", "warn"),
-    ("███████╗", "warn", "██╔╝ ██╗", "ok"),
-    ("╚══════╝", "dim", "╚═╝  ╚═╝", "ok"),
+    ("██╗  ██╗", "ok", "███████╗", "blue"),
+    ("╚██╗██╔╝", "ok", "██╔════╝", "blue"),
+    (" ╚███╔╝ ", "blue", "╚█████╗ ", "warn"),
+    (" ██╔██╗ ", "blue", "██╔══╝  ", "warn"),
+    ("██╔╝ ██╗", "warn", "╚██████╗", "ok"),
+    ("╚═╝  ╚═╝", "dim", " ╚═════╝", "ok"),
 ]
 LOGO_WIDTH = 16
 
@@ -718,7 +718,7 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
     for left, left_role, mid, mid_role in LOGO:
         logo_inner.append([(left, left_role), (mid, mid_role),
                            (" " * (LOGO_WIDTH - len(left) - len(mid)), "")])
-    caption = "-lynxy-dev-"
+    caption = "- model gate -"
     pad = max(0, (LOGO_WIDTH - len(caption)) // 2)
     logo_inner.append([(" " * pad, ""), (caption, "head"),
                        (" " * (LOGO_WIDTH - pad - len(caption)), "")])
@@ -1070,7 +1070,7 @@ def compact_header_section(state: dict, width: int, sel: dict | None = None) -> 
             power_line += extra
             used += cost
     info.append(power_line)
-    lines = box("model-gate · -lynxy-dev-", info, width)
+    lines = box("model-gate", info, width)
 
     spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time()) % 10]
     live_inner: list[list[Seg]] = []
