@@ -844,8 +844,9 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
                 role, mark = "dim", "·"
             if sel and sel["kind"] == "model" and sel["backend"] == name and sel["id"] == model["id"]:
                 role, mark = "live", "▸"
-            star = "★" if model["id"] == selected_model else " "
-            inner.append([(f"{star}{mark} {model['id'][:sub_width - 6]}", role)])
+            # «» — выбранная для local-auto: тихий серый маркер, чтобы не спорил с ▶/◆
+            star: Seg = ("»" if model["id"] == selected_model else " ", "dim")
+            inner.append([star, (f"{mark} {model['id'][:sub_width - 6]}", role)])
         groups.append((name, inner))
     if not groups:
         return box("BACKENDS", [[("no data from gate", "warn")]], width)
