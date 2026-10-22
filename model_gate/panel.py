@@ -46,8 +46,12 @@ GRUVBOX_RGB = {
     "head":   (0x8E, 0xC0, 0x7C),   # aqua
     "live":   (0xD3, 0x86, 0x9B),   # purple
     "blue":   (0x83, 0xA5, 0x98),   # blue
+    # цель local-auto: янтарный, жирный если модель ещё и загружена
+    "sel":    (0xFA, 0xBD, 0x2F),   # yellow
+    "sel_on": (0xFA, 0xBD, 0x2F),   # yellow + bold
+    "cursor": (0xEB, 0xDB, 0xB2),   # fg1 — каретка видна на строке любого цвета
 }
-BOLD_ROLES = ("head", "live")
+BOLD_ROLES = ("head", "live", "sel_on", "cursor")
 # truecolor SGR: ncurses на macOS truecolor не умеет (нет setrgb в terminfo),
 # поэтому рендер — raw ANSI, как у Pi; цвета не зависят от палитры терминала
 SGR: dict[str, str] = {"": "\x1b[0m"}
@@ -836,17 +840,22 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
         if not vertical:  # в узком режиме пустая строка между статусом и списком не нужна
             inner.append([("", "")])
         for model in backend.get("models", []):
+            # состояние — только цветом: выбранная модель одна, отдельный маркер не нужен
+            on = bool(model.get("loaded") or model.get("running"))
+            here = bool(sel and sel["kind"] == "model" and sel["backend"] == name and sel["id"] == model["id"])
+            target = model["id"] == selected_model
             if model.get("active"):
                 role, mark = "live", "▶"
-            elif model.get("loaded") or model.get("running"):
-                role, mark = "ok", "◆"
+            elif on:
+                role, mark = ("sel_on" if target else "ok"), "◆"
+            elif target:
+                role, mark = "sel", "·"
             else:
                 role, mark = "dim", "·"
-            if sel and sel["kind"] == "model" and sel["backend"] == name and sel["id"] == model["id"]:
-                role, mark = "live", "▸"
-            # «» — выбранная для local-auto: тихий серый маркер, чтобы не спорил с ▶/◆
-            star: Seg = ("»" if model["id"] == selected_model else " ", "dim")
-            inner.append([star, (f"{mark} {model['id'][:sub_width - 6]}", role)])
+            # live съедает цвет выбранной модели — пусть тогда хотя бы стрелка остаётся янтарной
+            mark_role = "sel_on" if target and role == "live" else role
+            inner.append([("▸" if here else " ", "cursor"), (mark, mark_role),
+                          (f" {model['id'][:sub_width - 6]}", role)])
         groups.append((name, inner))
     if not groups:
         return box("BACKENDS", [[("no data from gate", "warn")]], width)
