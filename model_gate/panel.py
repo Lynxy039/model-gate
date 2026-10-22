@@ -130,10 +130,12 @@ class Actions:
     def stop(self, backend: str) -> None:
         self._run(f"stop {backend}", lambda: post_json(f"{self.gate_url}/admin/stop", {"backend": backend}))
 
-    def warm(self, model: str) -> None:
+    def _warm_request(self, model: str) -> None:
         payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "warmup"}]}
-        self._run(f"warmup {model[:24]}",
-                  lambda: post_json(f"{self.gate_url}/v1/chat/completions", payload, timeout=600))
+        post_json(f"{self.gate_url}/v1/chat/completions", payload, timeout=600)
+
+    def warm(self, model: str) -> None:
+        self._run(f"warmup {model[:24]}", lambda: self._warm_request(model))
 
     def restart(self, backend: str, model: str | None) -> None:
         self.stop(backend)
@@ -143,7 +145,9 @@ class Actions:
     def switch(self, model: str) -> None:
         def call():
             post_json(f"{self.gate_url}/admin/select", {"model": model})
-            self.warm(model)
+            # выполняем warmup в том же worker: статус не объявляет успех,
+            # пока модель действительно не ответила
+            self._warm_request(model)
         self._run(f"switch -> {model[:24]}", call)
 
     def cancel(self, request_id: int) -> None:
@@ -1119,7 +1123,9 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
     height, width = tty_.size()
     lines = render(state, width - 1, height, sel, compact)[:height - 1]
     if pending:
-        footer = f" {pending[1]}  [y/N] "
+        # подтверждение в начале строки: в узком режиме длинное описание не
+        # должно отрезать единственную подсказку, что именно нужно нажать.
+        footer = f" y=confirm n=cancel · {pending[1]} "
     else:
         status = actions.status() if actions else ""
         hint = f"  ▸ {sel['label']} [{sel['keys']}]" if sel else ""
@@ -1206,7 +1212,10 @@ def main() -> None:
             if pending:
                 if key == "y":
                     pending[0]()
-                pending = None
+                    pending = None
+                elif key in ("n", "ESC"):
+                    pending = None
+                # остальные клавиши игнорируются, запрос подтверждения остаётся
             elif key == "s" and sel and "s" in sel["keys"]:
                 backend = sel["backend"]
                 pending = (lambda b=backend: actions.stop(b), f"STOP backend {backend} (освободит RAM)")

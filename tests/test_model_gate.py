@@ -1,10 +1,12 @@
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import URLError
 
 from model_gate.gate import AdmissionGate, AdmissionPolicy
+from model_gate.panel import Actions
 from model_gate.proxy import Backend, GateServer, Lifecycle, LifecycleError, ProcessManager, ProxyHandler
 from model_gate.router import ModelRouter
 from model_gate.stats import StatsCollector
@@ -245,6 +247,25 @@ class ProxyAdminTests(unittest.TestCase):
 
         handler.server.select_model.assert_not_called()
         self.assertEqual(handler._json.call_args[0][0], 400)
+
+
+class PanelActionTests(unittest.TestCase):
+    def test_switch_selects_model_then_finishes_warmup_before_reporting_success(self):
+        actions = Actions("http://gate", "http://omlx")
+        calls = []
+        with patch("model_gate.panel.post_json", side_effect=lambda url, payload, **kwargs: calls.append((url, payload)) or {}):
+            actions.switch("glm5.3-flash")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not actions.status().endswith(": ok"):
+                time.sleep(0.01)
+        self.assertEqual(calls, [
+            ("http://gate/admin/select", {"model": "glm5.3-flash"}),
+            ("http://gate/v1/chat/completions", {
+                "model": "glm5.3-flash", "max_tokens": 1,
+                "messages": [{"role": "user", "content": "warmup"}],
+            }),
+        ])
+        self.assertTrue(actions.status().endswith(": ok"))
 
 
 class ProxyStreamingTests(unittest.TestCase):
