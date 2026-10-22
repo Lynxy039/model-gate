@@ -94,6 +94,9 @@ def build_targets(state: dict) -> list[dict]:
         managed = backend.get("process") is not None
         targets.append({"kind": "backend", "backend": backend["name"], "managed": managed,
                         "label": f"backend {backend['name']}", "keys": "s r w" if managed else "o"})
+        for model in backend.get("models", []):
+            targets.append({"kind": "model", "backend": backend["name"], "id": model["id"],
+                            "label": f"model {model['id'][:30]} ({backend['name']})", "keys": "m"})
     return targets
 
 
@@ -136,6 +139,12 @@ class Actions:
         self.stop(backend)
         if model:
             self.warm(model)
+
+    def switch(self, model: str) -> None:
+        def call():
+            post_json(f"{self.gate_url}/admin/select", {"model": model})
+            self.warm(model)
+        self._run(f"switch -> {model[:24]}", call)
 
     def cancel(self, request_id: int) -> None:
         self._run(f"cancel #{request_id}", lambda: post_json(f"{self.gate_url}/admin/cancel", {"id": request_id}))
@@ -736,6 +745,7 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
     metrics = stats.get("backend_metrics", {})
     omlx = state.get("omlx") or {}
     sub_width = width - 4 if vertical else (width - 4 - 1) // 2
+    selected_model = status.get("selected") or ""
     now = time.time()
     groups: list[tuple[str, list[list[Seg]]]] = []
     for backend in sorted(status.get("backends", []), key=lambda b: b["name"]):
@@ -795,7 +805,8 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
                 role, mark = "ok", "◆"
             else:
                 role, mark = "dim", "·"
-            inner.append([(f"{mark} {model['id'][:sub_width - 5]}", role)])
+            star = "★" if model["id"] == selected_model else " "
+            inner.append([(f"{star}{mark} {model['id'][:sub_width - 6]}", role)])
         groups.append((name, inner))
     if not groups:
         return box("BACKENDS", [[("no data from gate", "warn")]], width)
@@ -1208,6 +1219,8 @@ def main() -> None:
                 models = backend_models(backend)
                 warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")), None)
                 pending = (lambda b=backend, m=warm_model: actions.restart(b, m), f"RESTART backend {backend}")
+            elif key == "m" and sel and "m" in sel["keys"]:
+                pending = (lambda m=sel["id"]: actions.switch(m), f"SWITCH auto -> {sel['id'][:34]} (остановит текущую модель ds4)")
             elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
             elif key == "o" and sel and "o" in sel["keys"]:

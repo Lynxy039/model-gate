@@ -223,6 +223,38 @@ class ProxyAdminTests(unittest.TestCase):
         handler.server.processes.stop.assert_called_once_with("ds4")
         handler._json.assert_called_once_with(200, {"ok": True, "backend": "ds4"})
 
+    def test_select_endpoint_points_auto_alias_at_known_model(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/admin/select"
+        handler.client_address = ("127.0.0.1", 1234)
+        handler._read_body = Mock(return_value=b'{"model":"glm5.3-flash"}')
+        handler._json = Mock()
+        handler.server = SimpleNamespace(
+            router=SimpleNamespace(backend_for=Mock(return_value="ds4")),
+            select_model=Mock(),
+        )
+
+        ProxyHandler.do_POST(handler)
+
+        handler.server.select_model.assert_called_once_with("glm5.3-flash")
+        handler._json.assert_called_once_with(200, {"ok": True, "selected": "glm5.3-flash"})
+
+    def test_select_endpoint_rejects_unknown_model(self):
+        handler = object.__new__(ProxyHandler)
+        handler.path = "/admin/select"
+        handler.client_address = ("127.0.0.1", 1234)
+        handler._read_body = Mock(return_value=b'{"model":"ghost"}')
+        handler._json = Mock()
+        handler.server = SimpleNamespace(
+            router=SimpleNamespace(backend_for=Mock(side_effect=ValueError("no backend configured for model: ghost"))),
+            select_model=Mock(),
+        )
+
+        ProxyHandler.do_POST(handler)
+
+        handler.server.select_model.assert_not_called()
+        self.assertEqual(handler._json.call_args[0][0], 400)
+
 
 class ProxyStreamingTests(unittest.TestCase):
     def test_copy_stream_reads_one_upstream_chunk_and_flushes_each_time(self):

@@ -26,6 +26,8 @@ from .stats import InFlight, StatsCollector
 LOGGER = logging.getLogger(__name__)
 
 BACKEND_V1_RE = re.compile(r"^/([^/]+)/v1/(.*)$")
+# алиас единой точки входа: Pi шлёт model="auto", гейт подставляет выбранную в панели
+AUTO_ALIAS = "auto"
 
 
 def _model_entry(backend: Backend, model: str) -> dict:
@@ -381,6 +383,11 @@ class GateServer(ThreadingHTTPServer):
         )
         self.stats = StatsCollector()
         self.processes = ProcessManager(self.backends, log_sink=self.stats.record_backend_log)
+        # модель по умолчанию для алиаса "auto": выбор из панели (POST /admin/select)
+        # переживает рестарт гейта через файл, иначе — auto_model из конфига
+        self._selected_lock = threading.Lock()
+        self._selected_file = Path("/tmp/model-gate.selected")
+        self.selected = self._load_selected() or str(config.get("auto_model", "")) or None
         self.max_body_bytes = int(config.get("max_body_bytes", 64 * 1024 * 1024))
         self.upstream_timeout = float(config.get("upstream_timeout", 600))
         self.failure_cooldown = float(config.get("lifecycle_failure_cooldown", 5))
@@ -392,6 +399,24 @@ class GateServer(ThreadingHTTPServer):
         self._blocked_reason = ""
         super().__init__(address, handler)
         self.refresh_models()
+
+    def resolve_auto(self) -> str:
+        with self._selected_lock:
+            return self.selected or ""
+
+    def select_model(self, model: str) -> None:
+        with self._selected_lock:
+            self.selected = model
+            try:
+                self._selected_file.write_text(model)
+            except OSError:
+                pass  # персистентность — удобство, не обязательное условие
+
+    def _load_selected(self) -> str:
+        try:
+            return self._selected_file.read_text().strip()
+        except OSError:
+            return ""
 
     def refresh_models(self, only: str | None = None) -> None:
         # ponytail: serial refresh — up to len(backends) * model_discovery_timeout
@@ -440,7 +465,7 @@ class GateServer(ThreadingHTTPServer):
                     "running": bool(process and process["model"] == model),
                 } for model in models],
             })
-        return {**admission, "backends": backends}
+        return {**admission, "selected": self.selected, "backends": backends}
 
     def lifecycle_available(self) -> tuple[bool, str]:
         with self.state_lock:
@@ -510,6 +535,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/admin/cancel":
             self._cancel_request()
             return
+        if self.path == "/admin/select":
+            self._select_model()
+            return
         # /<backend>/v1/* is a per-backend view: strip the prefix, routing is
         # still by model name (the prefix is for discovery, not access control).
         view_backend: str | None = None
@@ -528,6 +556,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             model = payload.get("model")
             if not isinstance(model, str) or not model:
                 raise ValueError("JSON field 'model' is required")
+            if model == AUTO_ALIAS:
+                # единая точка входа Pi: алиас резолвится в модель, выбранную в панели
+                resolved = self.server.resolve_auto()
+                if not resolved:
+                    raise ValueError("no model selected for 'auto' (pick one in mgpan)")
+                payload["model"] = resolved
+                body = json.dumps(payload, ensure_ascii=False).encode()
+                model = resolved
             try:
                 backend_name = self.server.router.backend_for(model)
             except ValueError:
@@ -628,6 +664,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
         self.close_connection = True
+
+    def _select_model(self) -> None:
+        if not self._admin_allowed():
+            return
+        try:
+            model = json.loads(self._read_body()).get("model")
+            if not isinstance(model, str) or not model:
+                raise ValueError("known JSON field 'model' is required")
+            self.server.router.backend_for(model)  # неизвестная модель -> ValueError
+        except (ValueError, json.JSONDecodeError) as error:
+            self._json(400, {"error": str(error)})
+            return
+        self.server.select_model(model)
+        LOGGER.info("auto alias now points to model=%s", model)
+        self._json(200, {"ok": True, "selected": model})
 
     def _stop_backend(self) -> None:
         if not self._admin_allowed():
