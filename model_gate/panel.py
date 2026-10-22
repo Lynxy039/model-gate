@@ -1226,6 +1226,9 @@ def main() -> None:
                 sel_index = min(sel_index + 1, max(0, len(targets) - 1))
             elif key in ("UP", "k"):
                 sel_index = max(0, sel_index - 1)
+            # sel пересчитываем ПОСЛЕ сдвига индекса: иначе на этом витке
+            # рисовался старый курсор, а новый — только через 0.5 с таймаута
+            sel = targets[sel_index] if targets else None
             if not paused:
                 state["_recent_view"] = recent[scroll:]
                 draw(tty_, state, sel, actions, pending, compact)
