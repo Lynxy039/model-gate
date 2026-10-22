@@ -1222,7 +1222,7 @@ def main() -> None:
                 warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")), None)
                 pending = (lambda b=backend, m=warm_model: actions.restart(b, m), f"RESTART backend {backend}")
             elif key == "m" and sel and "m" in sel["keys"]:
-                pending = (lambda m=sel["id"]: actions.switch(m), f"SWITCH auto -> {sel['id'][:34]} (остановит текущую модель ds4)")
+                pending = (lambda m=sel["id"]: actions.switch(m), f"SWITCH local-auto -> {sel['id'][:34]} (остановит текущую модель ds4)")
             elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
             elif key == "o" and sel and "o" in sel["keys"]:

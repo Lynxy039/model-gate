@@ -110,13 +110,15 @@ class ProxyModelDiscoveryTests(unittest.TestCase):
         handler = object.__new__(ProxyHandler)
         handler.path = "/v1/models"
         handler._json = Mock()
-        handler.server = SimpleNamespace(resolve_auto=Mock(return_value="glm5.3-flash"))
+        handler.server = SimpleNamespace(resolve_auto=Mock(return_value="glm5.3-flash"),
+                                         auto_context=Mock(return_value=262144))
 
         ProxyHandler.do_GET(handler)
 
         data = handler._json.call_args[0][1]["data"]
-        self.assertEqual([m["id"] for m in data], ["auto"])
+        self.assertEqual([m["id"] for m in data], ["local-auto"])
         self.assertEqual(data[0]["selected"], "glm5.3-flash")
+        self.assertEqual(data[0]["max_context_length"], 262144)
 
     def test_refresh_models_stores_metadata_and_respects_only(self):
         server = object.__new__(GateServer)

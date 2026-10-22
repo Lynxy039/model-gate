@@ -26,8 +26,9 @@ from .stats import InFlight, StatsCollector
 LOGGER = logging.getLogger(__name__)
 
 BACKEND_V1_RE = re.compile(r"^/([^/]+)/v1/(.*)$")
-# алиас единой точки входа: Pi шлёт model="auto", гейт подставляет выбранную в панели
-AUTO_ALIAS = "auto"
+# алиас единой точки входа: Pi шлёт model="local-auto", гейт подставляет
+# выбранную в панели модель
+AUTO_ALIAS = "local-auto"
 
 
 def _model_entry(backend: Backend, model: str) -> dict:
@@ -383,7 +384,7 @@ class GateServer(ThreadingHTTPServer):
         )
         self.stats = StatsCollector()
         self.processes = ProcessManager(self.backends, log_sink=self.stats.record_backend_log)
-        # модель по умолчанию для алиаса "auto": выбор из панели (POST /admin/select)
+        # модель по умолчанию для алиаса local-auto: выбор из панели (POST /admin/select)
         # переживает рестарт гейта через файл, иначе — auto_model из конфига
         self._selected_lock = threading.Lock()
         self._selected_file = Path("/tmp/model-gate.selected")
@@ -404,6 +405,27 @@ class GateServer(ThreadingHTTPServer):
     def resolve_auto(self) -> str:
         with self._selected_lock:
             return self.selected or ""
+
+    def auto_context(self) -> int:
+        """Реальный контекст выбранной модели: метаданные discovery, для ds4 —
+        --ctx из команды запуска; неизвестно — 200000 как в конфиге Pi."""
+        model = self.resolve_auto()
+        try:
+            backend = self.backends[self.router.backend_for(model)]
+        except (KeyError, ValueError):
+            return 200000
+        meta = backend.model_meta.get(model, {})
+        for key in ("max_model_len", "context_length", "max_context_length", "context"):
+            value = meta.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        command = backend.command_for(model) or []
+        if "--ctx" in command:
+            try:
+                return int(command[command.index("--ctx") + 1])
+            except (IndexError, ValueError):
+                pass
+        return 200000
 
     def select_model(self, model: str) -> None:
         with self._selected_lock:
@@ -516,7 +538,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "object": "list",
                 "data": [{
                     "id": AUTO_ALIAS, "object": "model", "owned_by": "model-gate",
-                    "max_context_length": 200000,
+                    "max_context_length": self.server.auto_context(),
                     "selected": selected,
                 }],
             })
@@ -568,7 +590,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # единая точка входа Pi: алиас резолвится в модель, выбранную в панели
                 resolved = self.server.resolve_auto()
                 if not resolved:
-                    raise ValueError("no model selected for 'auto' (pick one in mgpan)")
+                    raise ValueError(f"no model selected for '{AUTO_ALIAS}' (pick one in mgpan)")
                 payload["model"] = resolved
                 body = json.dumps(payload, ensure_ascii=False).encode()
                 model = resolved
