@@ -93,7 +93,7 @@ def build_targets(state: dict) -> list[dict]:
                           key=lambda b: b["name"]):
         managed = backend.get("process") is not None
         targets.append({"kind": "backend", "backend": backend["name"], "managed": managed,
-                        "label": f"backend {backend['name']}", "keys": "s r w" if managed else "o"})
+                        "label": f"backend {backend['name']}", "keys": "s r w" + (" K" if backend["name"] == "ds4" else "") if managed else "o"})
         for model in backend.get("models", []):
             targets.append({"kind": "model", "backend": backend["name"], "id": model["id"],
                             "label": f"model {model['id'][:30]} ({backend['name']})", "keys": "m"})
@@ -120,8 +120,8 @@ class Actions:
     def _run(self, label: str, call) -> None:
         def worker():
             try:
-                call()
-                self._set(f"{label}: ok")
+                result = call()
+                self._set(f"{label}: {result}" if result is not None else f"{label}: ok")
             except Exception as error:  # noqa: BLE001 — что угодно с апстрима пишем в футер, не в краш
                 self._set(f"{label}: {str(error)[:70]}")
         self._set(f"{label}: sending…")
@@ -143,6 +143,28 @@ class Actions:
             if model:
                 self._warm_request(model)
         self._run(f"restart {backend}", call)
+
+    def clear_kv(self, backend: str, model: str | None) -> None:
+        """Чистка дискового KV-кэша ds4: сервер обязан быть остановлен
+        (документация ds4: каталог disposable, чистить при живом сервере нельзя)."""
+        def call():
+            post_json(f"{self.gate_url}/admin/stop", {"backend": backend})
+            kv = read_kv_dir()
+            removed, freed = 0, 0
+            if kv:
+                path, _ = kv
+                try:
+                    for entry in os.scandir(path):
+                        if entry.name.endswith(".kv"):
+                            freed += entry.stat().st_size
+                            os.unlink(entry.path)
+                            removed += 1
+                except OSError as error:
+                    raise RuntimeError(f"wipe {path}: {error}") from error
+            if model:
+                self._warm_request(model)
+            return f"{removed} файлов, {freed / 2**30:.1f}G"
+        self._run(f"clear kv {backend}", call)
 
     def switch(self, model: str) -> None:
         def call():
@@ -1220,6 +1242,10 @@ def main() -> None:
                 actions.restart(backend, warm_model)
             elif key == "m" and sel and "m" in sel["keys"]:
                 actions.switch(sel["id"])
+            elif key == "K" and sel and "K" in sel["keys"]:
+                models = backend_models(sel["backend"])
+                warm_model = next((m["id"] for m in models if m.get("active") or m.get("loaded") or m.get("running")), None)
+                actions.clear_kv(sel["backend"], warm_model)
             elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
             elif key == "o" and sel and "o" in sel["keys"]:
