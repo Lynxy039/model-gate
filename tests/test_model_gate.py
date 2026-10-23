@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -171,7 +172,7 @@ class ProxyModelDiscoveryTests(unittest.TestCase):
             router=SimpleNamespace(backend_for=Mock(return_value="omlx")),
             lifecycle_available=Mock(return_value=(True, "")),
             gate=SimpleNamespace(acquire=Mock(return_value=lease)),
-            backends={"omlx": object()},
+            backends={"omlx": Backend("omlx", "http://omlx", 1)},
             refresh_models=Mock(),
             stats=StatsCollector(),
             active_requests={}, _active_lock=threading.Lock(),
@@ -182,7 +183,7 @@ class ProxyModelDiscoveryTests(unittest.TestCase):
         self.assertEqual(handler.path, "/v1/chat/completions")
         args = handler._forward.call_args.args
         self.assertIs(args[0], handler.server.backends["omlx"])
-        self.assertEqual(args[1], b'{"model":"coder"}')
+        self.assertEqual(json.loads(args[1]), {"model": "coder"})
         handler._json.assert_not_called()
 
 
@@ -195,6 +196,7 @@ class ProxyAdminTests(unittest.TestCase):
         handler._json = Mock()
         handler.server = SimpleNamespace(
             backends={"ds4": object()},
+            gate=AdmissionGate({}), lifecycle=SimpleNamespace(forget=Mock()),
             processes=SimpleNamespace(stop=Mock(return_value=True)),
         )
 
@@ -324,7 +326,7 @@ class ProxyStreamingTests(unittest.TestCase):
             router=SimpleNamespace(backend_for=Mock(return_value="ds4")),
             lifecycle_available=Mock(return_value=(True, "")),
             gate=SimpleNamespace(acquire=Mock(return_value=lease)),
-            backends={"ds4": object()},
+            backends={"ds4": Backend("ds4", "http://ds4", 1)},
             stats=StatsCollector(),
             active_requests={}, _active_lock=threading.Lock(),
         )

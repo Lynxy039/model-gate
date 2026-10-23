@@ -4,6 +4,7 @@
   "require_unload": true,
   "lifecycle_timeout": 30,
   "upstream_timeout": 600,
+  "queue_timeout": 600,
   "lifecycle_failure_cooldown": 5,
   "max_body_bytes": 67108864,
   "model_discovery_timeout": 3,
@@ -35,8 +36,8 @@
       "stop_on_proxy_exit": true,
       "models": ["text-model", "vision-model"],
       "model_commands": {
-        "text-model": ["/path/to/server", "-m", "/path/to/text.gguf", "--host", "0.0.0.0", "--port", "8003", "--ctx", "131072"],
-        "vision-model": ["/path/to/server", "-m", "/path/to/vision.gguf", "--vision", "/path/to/encoder.gguf", "--host", "0.0.0.0", "--port", "8003", "--ctx", "131072"]
+        "text-model": ["/path/to/server", "-m", "/path/to/text.gguf", "--host", "127.0.0.1", "--port", "8003", "--ctx", "131072"],
+        "vision-model": ["/path/to/server", "-m", "/path/to/vision.gguf", "--vision", "/path/to/encoder.gguf", "--host", "127.0.0.1", "--port", "8003", "--ctx", "131072"]
       }
     }
   }

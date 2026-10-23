@@ -20,14 +20,17 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
 import tty
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 EIGHTHS = " ▁▂▃▄▅▆▇█"
@@ -95,7 +98,7 @@ def apply_theme(name: str) -> str:
     THEME = name
     SGR.clear()
     SGR[""] = "\x1b[0m"
-    SGR.update({role: ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g};{b}m"
+    SGR.update({role: "\x1b[0m" + ("\x1b[1m" if role in BOLD_ROLES else "") + f"\x1b[38;2;{r};{g};{b}m"
                 for role, (r, g, b) in palette.items()})
     return THEME
 
@@ -182,7 +185,8 @@ def build_targets(state: dict) -> list[dict]:
 class Actions:
     """Управляющие команды: fire-and-forget поток + строка статуса в футер."""
 
-    def __init__(self, gate_url: str, omlx_url: str):
+    def __init__(self, gate_url: str, omlx_url: str, config: str | None = None):
+        self.config = config
         self.gate_url = gate_url.rstrip("/")
         self.omlx_url = omlx_url.rstrip("/")
         self.lock = threading.Lock()
@@ -211,7 +215,7 @@ class Actions:
         threading.Thread(target=worker, daemon=True).start()
 
     def stop(self, backend: str) -> None:
-        self._run(f"stop {backend}", lambda: post_json(f"{self.gate_url}/admin/stop", {"backend": backend}))
+        self._run(f"stop {backend}", lambda: post_json(f"{self.gate_url}/admin/stop", {"backend": backend}, timeout=150))
 
     def _warm_request(self, model: str) -> None:
         payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "warmup"}]}
@@ -230,33 +234,29 @@ class Actions:
         script = Path(__file__).resolve().parents[1] / "mgrun"
 
         def call():
-            log = open("/tmp/mgpan-gate-restart.log", "ab", buffering=0)
-            subprocess.Popen([sys.executable, str(script), "--restart-gate"],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                             start_new_session=True)
-            return "ждём /healthz"
+            self._require_local_gate()
+            if not self.config and self.gate_url != "http://127.0.0.1:9000":
+                raise RuntimeError("restart requires --config for a non-default gate URL")
+            command = [sys.executable, str(script), "--restart-gate"]
+            if self.config:
+                command += ["--config", self.config]
+            log_dir = Path.home() / ".local" / "state" / "mgpan"
+            log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(log_dir / "restart.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "ab", buffering=0) as log:
+                subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True)
+            return "waiting for /healthz"
         self._run("restart gate", call)
 
     def clear_kv(self, backend: str, model: str | None) -> None:
         """Чистка дискового KV-кэша ds4: сервер обязан быть остановлен
         (документация ds4: каталог disposable, чистить при живом сервере нельзя)."""
         def call():
-            post_json(f"{self.gate_url}/admin/stop", {"backend": backend})
-            kv = read_kv_dir()
-            removed, freed = 0, 0
-            if kv:
-                path, _ = kv
-                try:
-                    for entry in os.scandir(path):
-                        if entry.name.endswith(".kv"):
-                            freed += entry.stat().st_size
-                            os.unlink(entry.path)
-                            removed += 1
-                except OSError as error:
-                    raise RuntimeError(f"wipe {path}: {error}") from error
+            result = post_json(f"{self.gate_url}/admin/clear-kv", {"backend": backend}, timeout=150)
             if model:
-                self._warm_request(model)
-            return f"{removed} файлов, {freed / 2**30:.1f}G"
+                self._warm_request("local-auto")
+            return f"{result['removed']} files, {result['freed_bytes'] / 2**30:.1f}G"
         self._run(f"clear kv {backend}", call)
 
     def switch(self, model: str) -> None:
@@ -270,13 +270,27 @@ class Actions:
     def cancel(self, request_id: int) -> None:
         self._run(f"cancel #{request_id}", lambda: post_json(f"{self.gate_url}/admin/cancel", {"id": request_id}))
 
+    def _require_local_gate(self) -> None:
+        if urlsplit(self.gate_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise RuntimeError("this action controls local processes; remote gate is not supported")
+
     def omlx_restart(self, cli: str) -> None:
-        self._run("omlx restart",
-                  lambda: subprocess.run(shlex.split(cli) + ["restart"], capture_output=True, text=True, timeout=180))
+        def call():
+            self._require_local_gate()
+            subprocess.run(shlex.split(cli) + ["restart"], capture_output=True,
+                           text=True, timeout=180, check=True)
+        self._run("omlx restart", call)
 
     def stop_gate(self, pid_file: str = "/tmp/model-gate.pid") -> None:
         def call():
+            self._require_local_gate()
             pid = int(Path(pid_file).read_text().strip())
+            if pid <= 1:
+                raise ValueError("invalid gate PID")
+            command = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                     capture_output=True, text=True, timeout=5).stdout
+            if "-m model_gate" not in command:
+                raise RuntimeError("PID file does not point to model-gate")
             os.kill(pid, signal.SIGTERM)
         self._run("stop gate", call)
 
@@ -297,8 +311,8 @@ class Actions:
             status = fetch_json(f"{self.gate_url}/admin/status")
             stopped = [b["name"] for b in status.get("backends", []) if b.get("process")]
             for backend in stopped:
-                post_json(f"{self.gate_url}/admin/stop", {"backend": backend})
-            return f"отменено {len(ids)} · остановлен {' '.join(stopped) or '—'}"
+                post_json(f"{self.gate_url}/admin/stop", {"backend": backend}, timeout=150)
+            return f"cancelled {len(ids)} · stopped {' '.join(stopped) or '—'}"
         self._run("emergency", call)
 
 
@@ -398,7 +412,7 @@ def read_process_rss(patterns: dict[str, str]) -> dict[str, int]:
     return result
 
 
-def read_kv_dir() -> tuple[str, int] | None:
+def read_kv_dir() -> tuple[str, int | None] | None:
     """--kv-disk-dir и лимит из командной строки живого ds4-server."""
     raw = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
     for line in raw.splitlines():
@@ -448,13 +462,14 @@ class Poller(threading.Thread):
             "rates": {"req_min": 0},
         }
         self._gpu_proc: subprocess.Popen | None = None
+        self._macmon_proc: subprocess.Popen | None = None
         self._gpu_log = None
-        self._kv_dir: tuple[str, int] | None = None
-        self._stop = threading.Event()
+        self._kv_dir: tuple[str, int | None] | None = None
+        self._stop_event = threading.Event()
 
     def _start_gpu(self) -> None:
         try:
-            self._gpu_log = open("/tmp/mgpan-gpu.log", "w")
+            self._gpu_log = tempfile.TemporaryFile(mode="w+")
             self._gpu_proc = subprocess.Popen(
                 # без -n: на macOS 26 "-n 0" больше не «бесконечно», а «ноль сэмплов»
                 ["sudo", "-n", "powermetrics", "--samplers",
@@ -466,46 +481,35 @@ class Poller(threading.Thread):
 
     def _gpu_error(self) -> str:
         try:
-            tail = open("/tmp/mgpan-gpu.log").read().strip().splitlines()[-1:]
-        except OSError:
+            self._gpu_log.seek(0)
+            tail = self._gpu_log.read().strip().splitlines()[-1:]
+        except (OSError, ValueError, AttributeError):
             tail = []
         return tail[0][:60] if tail else ""
 
     def _pump_gpu(self) -> None:
-        dbg = open("/tmp/mgpan-gpu-dbg.log", "w", buffering=1)
-        dbg.write(f"pump started {time.strftime('%H:%M:%S')}\n")
         try:
-            self._pump_gpu_inner(dbg)
-        except Exception:
-            import traceback
-            dbg.write("CRASH:\n" + traceback.format_exc())
+            self._pump_gpu_inner()
+        except Exception as error:
             with self.lock:
-                self.state["gpu_note"] = "pump crashed (see /tmp/mgpan-gpu-dbg.log)"
-        dbg.write("pump ended\n")
+                self.state["gpu_note"] = f"GPU sampler: {error}"
 
-    def _pump_gpu_inner(self, dbg) -> None:
+    def _pump_gpu_inner(self) -> None:
         if not self._gpu_proc:
-            dbg.write("no gpu proc\n")
             return
         buffer = ""
-        lines = 0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self._gpu_proc.poll() is not None:
-                dbg.write(f"proc exit code={self._gpu_proc.returncode}\n")
                 with self.lock:
                     self.state["gpu_note"] = f"powermetrics exit: {self._gpu_error() or 'code ' + str(self._gpu_proc.returncode)}"
                 return
             line = self._gpu_proc.stdout.readline()
             if not line:
                 code = self._gpu_proc.poll()
-                dbg.write(f"EOF on stdout, poll={code}\n")
                 with self.lock:
                     self.state["gpu_note"] = (f"powermetrics exit: {self._gpu_error() or 'code ' + str(code)}"
                                               if code is not None else "powermetrics: no data")
                 return
-            lines += 1
-            if lines <= 60 or (line.strip() and lines <= 3000):
-                dbg.write(f"raw[{lines}]: {line.rstrip()}\n")
             buffer += line
             if line.strip():
                 continue  # копит секцию до пустой строки: Power идёт после residency
@@ -553,7 +557,8 @@ class Poller(threading.Thread):
                                     stderr=subprocess.DEVNULL, text=True)
         except OSError:
             return
-        while not self._stop.is_set():
+        self._macmon_proc = proc
+        while not self._stop_event.is_set():
             line = proc.stdout.readline()
             if not line:
                 break
@@ -603,7 +608,7 @@ class Poller(threading.Thread):
             threading.Thread(target=self._pump_gpu, daemon=True).start()
         threading.Thread(target=self._pump_macmon, daemon=True).start()
         cycle = 0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             started = time.monotonic()
             try:
                 self._sample(cycle)
@@ -614,7 +619,7 @@ class Poller(threading.Thread):
             else:
                 with self.lock:
                     self.state["poll_error"] = ""
-            self._stop.wait(max(0.2, 1.1 - (time.monotonic() - started)))
+            self._stop_event.wait(max(0.2, 1.1 - (time.monotonic() - started)))
             cycle += 1
 
     def _sample(self, cycle: int) -> None:
@@ -645,8 +650,7 @@ class Poller(threading.Thread):
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
         if cycle % 3 == 0:  # каталог KV-кэша: путь ловим один раз, размер — периодически
-            if self._kv_dir is None:
-                self._kv_dir = read_kv_dir()
+            self._kv_dir = read_kv_dir()
             if self._kv_dir:
                 path, cap = self._kv_dir
                 used = dir_size(path)
@@ -671,9 +675,12 @@ class Poller(threading.Thread):
             self.state["rates"]["req_min"] = sum(1 for r in recent if r["ts"] >= cutoff)
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._gpu_proc:
-            self._gpu_proc.terminate()
+        self._stop_event.set()
+        for process in (self._gpu_proc, self._macmon_proc):
+            if process is not None:
+                process.terminate()
+        if self._gpu_log is not None:
+            self._gpu_log.close()
 
 
 # ---------------------------------------------------------------- box helpers
@@ -895,7 +902,8 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
     stats = state.get("gate_stats") or {}
     metrics = stats.get("backend_metrics", {})
     omlx = state.get("omlx") or {}
-    sub_width = width - 4 if vertical else (width - 4 - 1) // 2
+    count = max(1, len(status.get("backends", [])))
+    sub_width = width - 4 if vertical else (width - 4 - (count - 1)) // count
     selected_model = status.get("selected") or ""
     now = time.time()
     groups: list[tuple[str, list[list[Seg]]]] = []
@@ -955,17 +963,15 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
             here = bool(sel and sel["kind"] == "model" and sel["backend"] == name and sel["id"] == model["id"])
             target = model["id"] == selected_model
             if model.get("active"):
-                role, mark = "live", "▶"
+                role = "live"
             elif on:
-                role, mark = ("sel_on" if target else "ok"), "◆"
+                role = "sel_on" if target else "ok"
             elif target:
-                role, mark = "sel", "·"
+                role = "sel"
             else:
-                role, mark = "dim", "·"
-            # live съедает цвет выбранной модели — пусть тогда хотя бы стрелка остаётся янтарной
-            mark_role = "sel_on" if target and role == "live" else role
-            inner.append([("▸" if here else " ", "cursor"), (mark, mark_role),
-                          (f" {model['id'][:sub_width - 6]}", role)])
+                role = "dim"
+            inner.append([("▸" if here else " ", "cursor"),
+                          (f" {model['id'][:max(0, sub_width - 6)]}", role)])
         groups.append((name, inner))
     if not groups:
         return box("BACKENDS", [[("no data from gate", "warn")]], width)
@@ -990,7 +996,7 @@ def models_section(state: dict, width: int, compact: bool = False) -> list[list[
         # узкий режим: только главные колонки, модель во всю оставшуюся ширину
         name_w = max(6, width - 4 - 26)
         inner.append([(f"{'model':<{name_w}}", "dim"), (f"{'req':>6}", "dim"),
-                      (f"{'in':>7}", "dim"), (f"{'out':>7}", "dim"), (f"{'t/s':>6}", "dim")])
+                      (f"{'in':>7}", "dim"), (f"{'out':>7}", "dim"), (f"{'e2e':>6}", "dim")])
         for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
             model = models[key]
             avg_tps = model.get("avg_tps")
@@ -1004,7 +1010,7 @@ def models_section(state: dict, width: int, compact: bool = False) -> list[list[
     else:
         inner.append([("model" + " " * 29, "dim"), (f"{'req':>5}", "dim"), (f"{'in':>8}", "dim"),
                       (f"{'out':>8}", "dim"), (f"{'cache':>6}", "dim"), (f"{'pre t/s':>8}", "dim"),
-                      (f"{'gen t/s':>8}", "dim"), (f"{'last':>7}", "dim")])
+                      (f"{'e2e t/s':>8}", "dim"), (f"{'last':>7}", "dim")])
         for key in sorted(models, key=lambda k: -models[k]["completion_tokens"]):
             model = models[key]
             cache = model.get("cache_hit_rate")
@@ -1036,9 +1042,9 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
         # dur убран — cache-хит по каждому запросу важнее длительности
         name_w = max(6, width - 4 - 34)
         inner.append([(f"{'hh:mm':<6}", "dim"), (f"{'model':<{name_w}}", "dim"),
-                      (f"{'cache':>5}", "live"), (f"{'ttft':>6}", "dim"),
+                      (f"{'cache':>5}", "live"), (f"{'ttfb':>6}", "dim"),
                       (f"{'out':>6}", "blue"),
-                      (f"{'t/s':>5}", "orange"), (f"{'pre':>6}", "orange")])
+                      (f"{'e2e':>5}", "orange"), (f"{'pre':>6}", "orange")])
         for record in recent:
             stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M")
             if record.get("disconnected"):
@@ -1065,9 +1071,9 @@ def recent_section(state: dict, width: int, limit: int, compact: bool = False) -
     # колонки: каждая своим цветом — время тусклое, модель обычная, статус
     # по результату, токены синие, кэш розовый, скорости оранжевые
     inner.append([(f"{'time':<9}", "dim"), (f" {'model':<24}", "dim"), (" " + f"{'code':>4}", "dim"),
-                  (" " + f"{'dur':>7}", "dim"), (" " + f"{'ttft':>5}", "dim"),
+                  (" " + f"{'dur':>7}", "dim"), (" " + f"{'ttfb':>5}", "dim"),
                   (f" {'in':>7}", "blue"), (f" {'out':>6}", "blue"),
-                  (f" {'cache':>6}", "live"), (" " + f"{'gen t/s':>8}", "orange"), (f" {'pre t/s':>8}", "orange")])
+                  (f" {'cache':>6}", "live"), (" " + f"{'e2e t/s':>8}", "orange"), (f" {'pre t/s':>8}", "orange")])
     for record in recent:
         stamp = datetime.fromtimestamp(record["ts"]).strftime("%H:%M:%S")
         if record.get("disconnected"):
@@ -1144,6 +1150,9 @@ def compact_header_section(state: dict, width: int, sel: dict | None = None) -> 
             power_line += extra
             used += cost
     info.append(power_line)
+    if state.get("gate_error"):
+        info = [[("model-gate is NOT RESPONDING", "err")],
+                [(str(state["gate_error"]), "dim")]]
     lines = box("model-gate", info, width)
 
     spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.time()) % 10]
@@ -1222,6 +1231,9 @@ def render(state: dict, width: int, height: int, sel: dict | None = None,
 class Tty:
     """Raw-ANSI рендер: alt-screen, truecolor, сырой ввод — как у Pi, без ncurses."""
 
+    def __init__(self) -> None:
+        self._input = bytearray()
+
     def __enter__(self) -> "Tty":
         self.fd = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd)
@@ -1253,23 +1265,38 @@ class Tty:
                 if sgr != prev:
                     buf.append(sgr)
                     prev = sgr
-                buf.append(text)
+                buf.append(safe_text(text))
             buf.append("\x1b[0m\x1b[K\r\n")
             prev = None
-        buf.append("\x1b[7m" + ("\x1b[1m" if footer_bold else "") + footer + "\x1b[0m\x1b[K\x1b[J")
+        buf.append("\x1b[7m" + ("\x1b[1m" if footer_bold else "") + safe_text(footer) + "\x1b[0m\x1b[K\x1b[J")
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
 
     def key(self, timeout: float) -> str | None:
-        if not select.select([sys.stdin], [], [], timeout)[0]:
+        incomplete_csi = self._input.startswith(b"\x1b[") and not re.match(rb"\x1b\[[0-?]*[ -/]*[@-~]", self._input)
+        if not self._input or self._input == b"\x1b" or incomplete_csi:
+            if select.select([self.fd], [], [], timeout)[0]:
+                data = os.read(self.fd, 64)
+                if not data:
+                    return "ESC"
+                self._input.extend(data)
+            elif self._input == b"\x1b":
+                self._input.clear()
+                return "ESC"
+        if not self._input:
             return None
-        data = os.read(self.fd, 16)
-        if data.startswith(b"\x1b["):
-            return {"A": "UP", "B": "DOWN", "5~": "PgUp", "6~": "PgDn",
-                    "I": "FOCUS_IN", "O": "FOCUS_OUT"}.get(data[2:].decode("ascii", "ignore"))
-        if data == b"\x1b":
-            return "ESC"
-        return chr(data[0]) if data else None
+        if self._input.startswith(b"\x1b["):
+            match = re.match(rb"\x1b\[[0-?]*[ -/]*[@-~]", self._input)
+            if not match:
+                return None
+            sequence = match.group()
+            del self._input[:len(sequence)]
+            return {b"\x1b[A": "UP", b"\x1b[B": "DOWN", b"\x1b[5~": "PgUp",
+                    b"\x1b[6~": "PgDn", b"\x1b[I": "FOCUS_IN", b"\x1b[O": "FOCUS_OUT"}.get(sequence)
+        if self._input == b"\x1b":
+            return None
+        value = self._input.pop(0)
+        return "ESC" if value == 27 else chr(value)
 
 
 def draw(tty_: Tty, state: dict, sel: dict | None = None,
@@ -1290,8 +1317,13 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
     tty_.paint(lines, footer[:width - 1])
 
 
+def safe_text(text: str) -> str:
+    # Недоверенные имена моделей и ошибки не должны управлять терминалом/clipboard.
+    return "".join(char if char >= " " and not "\x7f" <= char <= "\x9f" else "?" for char in text)
+
+
 def flatten(segs: list[Seg]) -> str:
-    return "".join(text for text, _ in segs)
+    return "".join(safe_text(text) for text, _ in segs)
 
 
 def main() -> None:
@@ -1304,6 +1336,7 @@ def main() -> None:
     parser.add_argument("--compact", action="store_true",
                         help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
     parser.add_argument("--once", action="store_true", help="single frame to stdout, no TUI")
+    parser.add_argument("--config", help="gate config used by R (passed through mgrun)")
     parser.add_argument("--theme", default="",
                         help=f"палитра ({', '.join(THEMES)}); по умолчанию — последняя выбранная по T")
     args = parser.parse_args()
@@ -1335,10 +1368,11 @@ def main() -> None:
         poller.stop()
         return
 
-    actions = Actions(args.url, args.omlx_url)
+    actions = Actions(args.url, args.omlx_url, args.config)
     paused, scroll, sel_index, restart = False, 0, 0, False
     focused = True  # DEC 1004 приходит только на смене фокуса — стартуем «в фокусе»
-    with Tty() as tty_:
+    with Tty() as tty_, ExitStack() as cleanup:
+        cleanup.callback(poller.stop)
         compact = args.compact or tty_.size()[1] < 80
         prev_width = tty_.size()[1]
         poller.start()

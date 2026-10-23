@@ -4,18 +4,20 @@
 Идемпотентно: живой gate не перезапускается, панель просто подключается.
 Gate стартует независимо от терминала (start_new_session) — закрытие
 терминала или выход из панели (q) его не убивают. Выход вместе с gate:
-клавиша Q в панели (с подтверждением) или `mgrun --stop`.
+клавиша Q в панели (без подтверждения) или `mgrun --stop`.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -27,8 +29,9 @@ PID_FILE = Path("/tmp/model-gate.pid")
 def gate_alive(url: str) -> bool:
     try:
         with urlopen(Request(f"{url}/healthz"), timeout=2) as response:
-            return response.status == 200
-    except (URLError, OSError, ValueError):
+            payload = json.loads(response.read())
+            return response.status == 200 and payload.get("ok") is True and isinstance(payload.get("models"), dict)
+    except (URLError, OSError, ValueError, AttributeError):
         return False
 
 
@@ -46,8 +49,15 @@ def gate_url_from_config(config: Path) -> str:
 def stop_gate(url: str) -> None:
     if PID_FILE.exists():
         try:
-            os.kill(int(PID_FILE.read_text().strip()), signal.SIGTERM)
-            print(f"model-gate (pid {PID_FILE.read_text().strip()}) остановлен")
+            pid = int(PID_FILE.read_text().strip())
+            if pid <= 1:
+                sys.exit("invalid gate PID")
+            command = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                     capture_output=True, text=True, timeout=5).stdout
+            if "-m model_gate" not in command:
+                sys.exit("stale PID file does not point to model-gate; refusing to send SIGTERM")
+            os.kill(pid, signal.SIGTERM)
+            print(f"model-gate (pid {pid}) получил SIGTERM")
         except (ProcessLookupError, ValueError):
             print("процесс уже мёртв")
         PID_FILE.unlink(missing_ok=True)
@@ -58,13 +68,15 @@ def stop_gate(url: str) -> None:
 
 
 def start_gate(config: Path) -> subprocess.Popen:
-    log = open(REPO / "model-gate.log", "ab", buffering=0)
-    process = subprocess.Popen(
-        [sys.executable, "-m", "model_gate", "--config", str(config)],
-        cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-        start_new_session=True,
-    )
-    PID_FILE.write_text(str(process.pid))
+    with open(REPO / "model-gate.log", "ab", buffering=0) as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "model_gate", "--config", str(config)],
+            cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True,
+        )
+    with tempfile.NamedTemporaryFile(mode="w", dir=PID_FILE.parent, delete=False) as output:
+        output.write(str(process.pid))
+    os.replace(output.name, PID_FILE)
     return process
 
 
@@ -90,6 +102,25 @@ def wait_ready(url: str, process: subprocess.Popen, timeout: float = 60) -> None
     sys.exit(f"gate не поднялся за {timeout:.0f}s — смотри {REPO / 'model-gate.log'}")
 
 
+def launch(args, config: Path, url: str) -> None:
+    # Два одновременных mgrun не должны перезаписывать PID друг другу.
+    fd = os.open(str(PID_FILE) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.stop:
+            stop_gate(url)
+            wait_down(url)
+            return
+        if args.restart_gate and gate_alive(url):
+            stop_gate(url)
+            wait_down(url)
+        if not gate_alive(url):
+            print(f"стартую model-gate ({config})…")
+            process = start_gate(config)
+            wait_ready(url, process)
+        print(f"model-gate работает на {url}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="model-gate + панель одним чохом")
     parser.add_argument("--config", default=str(REPO / "model-gate.json"))
@@ -100,33 +131,15 @@ def main() -> None:
                         help="перезапустить gate и выйти (панель на R подключится сама)")
     parser.add_argument("--compact", action="store_true", help="узкий режим панели (боковая панель, телефон)")
     args = parser.parse_args()
-    config = Path(args.config)
+    config = Path(args.config).resolve()
     url = gate_url_from_config(config)
-
-    if args.stop:
-        stop_gate(url)
+    launch(args, config, url)
+    if args.stop or args.restart_gate:
         return
 
-    if args.restart_gate:
-        if gate_alive(url):
-            stop_gate(url)
-            wait_down(url)
-        print(f"перезапускаю model-gate ({config})…")
-        process = start_gate(config)
-        wait_ready(url, process)
-        print(f"model-gate поднят на {url}")
-        return
-
-    if gate_alive(url):
-        print(f"model-gate уже работает на {url} — подключаю панель…")
-    else:
-        print(f"стартую model-gate ({config})…")
-        process = start_gate(config)
-        wait_ready(url, process)
-        print(f"model-gate поднялся на {url}")
-
-    # argv[0] — реальный путь: клавиша R в панели перезапускается через execv
-    sys.argv = [str(REPO / "mgpan"), "--url", url, "--gpu" if args.gpu else "--no-gpu"] + (["--compact"] if args.compact else [])
+    # argv[0] — реальный путь: клавиша r перезапускает только панель через execv.
+    sys.argv = [str(REPO / "mgpan"), "--url", url, "--config", str(config),
+                "--gpu" if args.gpu else "--no-gpu"] + (["--compact"] if args.compact else [])
     sys.path.insert(0, str(REPO))
     from model_gate.panel import main as panel_main
     panel_main()

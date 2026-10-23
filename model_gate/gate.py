@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import threading
+import time
 
 
 ModelKey = tuple[str, str]
@@ -58,15 +60,35 @@ class AdmissionGate:
         self._active: dict[ModelKey, int] = {}
         self._ready: set[ModelKey] = set()
         self._waiting = 0
+        self._maintenance = False
 
-    def acquire(self, backend: str, model: str) -> Lease:
+    @contextmanager
+    def maintenance(self):
+        """Не допускаем новые запросы во время остановки и удаления KV."""
+        with self._condition:
+            if self._maintenance or self._active:
+                raise RuntimeError("gate is busy; cancel active requests before maintenance")
+            self._maintenance = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._maintenance = False
+                self._condition.notify_all()
+
+    def acquire(self, backend: str, model: str, policy: AdmissionPolicy | None = None,
+                timeout: float = 600) -> Lease:
         key = backend, model
-        policy = self._policies.get(key, self._default)
+        policy = policy or self._policies.get(key, self._default)
+        deadline = time.monotonic() + timeout
         with self._condition:
             self._waiting += 1
             try:
                 while not self._admissible(key, policy):
-                    self._condition.wait()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("admission queue timed out")
+                    self._condition.wait(remaining)
                 initialize = key not in self._active
                 self._active[key] = self._active.get(key, 0) + 1
                 return Lease(self, key, policy, initialize)
@@ -74,6 +96,8 @@ class AdmissionGate:
                 self._waiting -= 1
 
     def _admissible(self, key: ModelKey, policy: AdmissionPolicy) -> bool:
+        if self._maintenance:
+            return False
         own_active = self._active.get(key, 0)
         if own_active >= policy.max_concurrency:
             return False

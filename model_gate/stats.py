@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import re
 import threading
 import time
@@ -24,35 +25,32 @@ DS4_DECODE_RE = re.compile(r"decoding chunk=([\d.]+) t/s avg=([\d.]+) t/s")
 def parse_usage(buffer: bytes) -> dict | None:
     """Достать последний "usage":{...} из сырого ответа (JSON или SSE)."""
     text = buffer.decode("utf-8", errors="ignore")
-    index = text.rfind('"usage"')
-    if index < 0:
-        return None
-    brace = text.find("{", index)
-    if brace < 0:
-        return None
-    depth = 0
-    for position in range(brace, min(len(text), brace + 4096)):
-        if text[position] == "{":
-            depth += 1
-        elif text[position] == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    usage = json.loads(text[brace:position + 1])
-                except json.JSONDecodeError:
-                    return None
-                return usage if isinstance(usage, dict) else None
+    for match in reversed(list(re.finditer(r'"usage"\s*:\s*', text))):
+        try:
+            usage, _ = json.JSONDecoder().raw_decode(text[match.end():])
+        except ValueError:
+            continue
+        if isinstance(usage, dict):
+            return usage
     return None
+
+
+def positive_number(value) -> float | None:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number > 0 else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def usage_tokens(usage: dict) -> tuple[int, int, int]:
     """(prompt, completion, cached) из OpenAI-подобного usage-блока."""
-    details = usage.get("prompt_tokens_details") or {}
-    return (
-        int(usage.get("prompt_tokens") or 0),
-        int(usage.get("completion_tokens") or 0),
-        int(details.get("cached_tokens") or 0),
-    )
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+    return tuple(int(positive_number(value) or 0) for value in (
+        usage.get("prompt_tokens"), usage.get("completion_tokens"), details.get("cached_tokens"),
+    ))
 
 
 class InFlight:
@@ -139,6 +137,7 @@ class StatsCollector:
                 if seconds > 0 and tokens:
                     metrics["prefill_avg_tps"] = round(tokens / seconds, 1)
                 metrics["prompt_done_s"] = seconds
+                metrics["prefill_ts"] = time.time()
                 metrics["ts"] = time.time()
             return
         match = DS4_DECODE_RE.search(line)
@@ -151,7 +150,10 @@ class StatsCollector:
             return
         if "prompt start" in line and "ds4-server" in line:
             with self._lock:
-                self.backend_metrics.setdefault(backend, {})["prefill_peak_tps"] = 0.0
+                metrics = self.backend_metrics.setdefault(backend, {})
+                for key in ("prefill_avg_tps", "prefill_last_tps", "prefill_ts", "last_prompt_tokens"):
+                    metrics.pop(key, None)
+                metrics["prefill_peak_tps"] = 0.0
 
     def start(self, model: str, backend: str, stream: bool, context_chars: int) -> InFlight:
         with self._lock:
@@ -170,15 +172,16 @@ class StatsCollector:
         elapsed = time.monotonic() - inflight.started_monotonic
         usage = inflight.usage or inflight.parse_usage() or {}
         prompt, completion, cached = usage_tokens(usage)
-        prefill_tps = usage.get("prompt_tokens_per_second")
-        if not prefill_tps and prompt and usage.get("prompt_eval_duration"):
-            prefill_tps = round(prompt / usage["prompt_eval_duration"], 1)
+        prefill_tps = positive_number(usage.get("prompt_tokens_per_second"))
+        duration = positive_number(usage.get("prompt_eval_duration"))
+        if not prefill_tps and prompt and duration:
+            prefill_tps = round(prompt / duration, 1)
         if not prefill_tps:
             # ds4 не кладёт prefill в usage — берём из его stderr-метрик бэкенда,
             # если они обновлялись уже после старта этого запроса
             with self._lock:
                 metrics = dict(self.backend_metrics.get(inflight.backend, {}))
-            if metrics.get("prefill_avg_tps") and metrics.get("ts", 0) >= inflight.started_wall - 1:
+            if metrics.get("prefill_avg_tps") and metrics.get("prefill_ts", 0) >= inflight.started_wall:
                 prefill_tps = metrics["prefill_avg_tps"]
         key = f"{inflight.backend}/{inflight.model}"
         record = {
@@ -222,10 +225,6 @@ class StatsCollector:
             if prefill_tps:
                 model["last_prefill_tps"] = round(float(prefill_tps), 1)
             self.recent.appendleft(record)
-
-    def drop(self, inflight: InFlight) -> None:
-        with self._lock:
-            self.inflight.pop(inflight.id, None)
 
     def snapshot(self) -> dict:
         with self._lock:
