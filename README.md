@@ -1,5 +1,7 @@
 # model-gate
 
+[![Tests](https://github.com/Lynxy039/model-gate/actions/workflows/tests.yml/badge.svg)](https://github.com/Lynxy039/model-gate/actions/workflows/tests.yml)
+
 Локальный OpenAI-compatible proxy: сериализует переключения моделей между
 inference-серверами и отдаёт клиенту один алиас `local-auto`.
 Панель `mgpan` показывает запросы, статистику, RAM/GPU/CPU и управляет моделями.
