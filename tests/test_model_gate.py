@@ -195,10 +195,13 @@ class ProxyAdminTests(unittest.TestCase):
         handler._read_body = Mock(return_value=b'{"backend":"ds4"}')
         handler._json = Mock()
         handler.server = SimpleNamespace(
-            backends={"ds4": object()},
+            backends={'ds4': Backend('ds4', 'http://127.0.0.1:8003', 1, model_commands={'example': ['server']})},
             gate=AdmissionGate({}), lifecycle=SimpleNamespace(forget=Mock()),
             processes=SimpleNamespace(stop=Mock(return_value=True)),
         )
+        from model_gate.control import Controller
+        handler.server.controller = Controller(handler.server.gate, handler.server.lifecycle,
+            handler.server.processes, handler.server.backends, Mock())
 
         ProxyHandler.do_POST(handler)
 
@@ -381,11 +384,28 @@ class ProcessManagerTests(unittest.TestCase):
         manager._models["ds4"] = "flash"
 
         self.assertEqual(manager.snapshot(), {
-            "ds4": {"running": True, "pid": 1234, "model": "flash", "started_ts": None},
+            "ds4": {"running": True, "pid": 1234, "model": "flash", "started_ts": None, 'base_url': 'http://ds4'},
         })
         self.assertTrue(manager.stop("ds4"))
         process.terminate.assert_called_once_with()
         self.assertEqual(manager.snapshot(), {})
+
+    def test_auto_port_is_reserved_for_gate_backend_and_interpolated(self):
+        backend = Backend('ds4', 'http://127.0.0.1:0', 1,
+                          autostart_command=['server', '--port', '{port}'], auto_port=True,
+                          ready_path='/health', startup_poll_seconds=.001)
+        manager = ProcessManager({'ds4': backend})
+        process = Mock(); process.pid = 123
+        process.poll.return_value = None
+        manager._ready = Mock(side_effect=[False, True])
+        with patch('model_gate.proxy.subprocess.Popen', return_value=process) as popen, \
+             patch('model_gate.proxy.subprocess.run', return_value=SimpleNamespace(returncode=0)):
+            manager.ensure_ready('ds4', 'model')
+        command = popen.call_args.args[0]
+        port = int(command[command.index('--port') + 1])
+        self.assertGreater(port, 0)
+        self.assertEqual(backend.base_url, f'http://127.0.0.1:{port}')
+        self.assertEqual(manager.snapshot()['ds4']['base_url'], backend.base_url)
 
     def test_autostart_restarts_backend_when_model_command_changes(self):
         commands = {

@@ -1,44 +1,37 @@
 {
+  "$schema": "./model-gate.schema.json",
+  "version": 1,
   "listen": "127.0.0.1:9000",
-  "auto_model": "small-model",
+  "auto_model": "example-model",
+  "memory_profile_gb": 128,
   "require_unload": true,
-  "lifecycle_timeout": 30,
   "upstream_timeout": 600,
   "queue_timeout": 600,
-  "lifecycle_failure_cooldown": 5,
-  "max_body_bytes": 67108864,
-  "model_discovery_timeout": 3,
   "backends": {
-    "resident": {
-      "base_url": "http://127.0.0.1:8001",
-      "max_concurrency": 1,
-      "discover_models": true,
-      "settle_seconds": 2,
-      "unload_settle_seconds": 5,
-      "load_settle_seconds": 2,
-      "models": ["small-model", "big-model"],
-      "prefixes": ["small-", "big-"],
-      "model_policies": {
-        "small-model": {"max_concurrency": 4}
+    "ds4": {
+      "type": "ds4",
+      "binary": "ds4-server",
+      "port": "auto",
+      "models": {
+        "example-model": {
+          "path": "/absolute/path/to/model.gguf",
+          "context": 200000,
+          "args": []
+        }
       },
-      "unload_url": "http://127.0.0.1:8001/admin/api/models/{model}/unload",
-      "load_url": "http://127.0.0.1:8001/admin/api/models/{model}/load"
-    },
-    "ephemeral": {
-      "base_url": "http://127.0.0.1:8003",
-      "max_concurrency": 1,
-      "discover_models": false,
-      "requires_unload": false,
-      "settle_seconds": 5,
-      "ready_path": "/v1/models",
+      "kv_disk_space_mb": 65536,
       "startup_timeout": 120,
-      "startup_poll_seconds": 1,
-      "stop_on_proxy_exit": true,
-      "models": ["text-model", "vision-model"],
-      "model_commands": {
-        "text-model": ["/path/to/server", "-m", "/path/to/text.gguf", "--host", "127.0.0.1", "--port", "8003", "--ctx", "131072"],
-        "vision-model": ["/path/to/server", "-m", "/path/to/vision.gguf", "--vision", "/path/to/encoder.gguf", "--host", "127.0.0.1", "--port", "8003", "--ctx", "131072"]
-      }
+      "unload_timeout": 120
+    },
+    "omlx": {
+      "type": "omlx",
+      "base_url": "http://127.0.0.1:8001",
+      "discover_models": true,
+      "model_list_path": "/v1/models",
+      "model_status_path": "/v1/models/status",
+      "load_url": "/admin/api/models/{model}/load",
+      "unload_url": "/admin/api/models/{model}/unload",
+      "max_concurrency": 1
     }
   }
 }

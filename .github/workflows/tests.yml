@@ -26,3 +26,5 @@ jobs:
       - run: python -m unittest discover -v
       - run: python -m py_compile mgrun mgpan model_gate/*.py
       - run: python -m json.tool model-gate.example.json > /dev/null
+      - run: python -m pip install --no-deps --no-build-isolation --target "$RUNNER_TEMP/model-gate-install" .
+      - run: cd "$RUNNER_TEMP" && PYTHONPATH="$RUNNER_TEMP/model-gate-install" "$RUNNER_TEMP/model-gate-install/bin/model-gate" --help

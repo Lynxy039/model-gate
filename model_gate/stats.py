@@ -63,18 +63,30 @@ class InFlight:
         self.stream = stream
         self.context_chars = context_chars
         self.started_monotonic = time.monotonic()
+        self.enqueued_monotonic = self.started_monotonic
+        self.queue_s = None
         self.started_wall = time.time()
         self.lock = threading.Lock()
+        self.phase = 'queued'
         self.bytes = 0
         self.sse_events = 0
         self.first_byte_at: float | None = None
         self.usage: dict | None = None
         self._tail = bytearray()
 
+    def admit(self):
+        with self.lock:
+            now = time.monotonic()
+            self.queue_s = now - self.enqueued_monotonic
+            self.started_monotonic = now
+            self.started_wall = time.time()
+            self.phase = 'loading'
+
     def feed(self, chunk: bytes) -> None:
         with self.lock:
             if self.first_byte_at is None:
                 self.first_byte_at = time.monotonic()
+            self.phase = 'streaming'
             self.bytes += len(chunk)
             self.sse_events += chunk.count(b"data:")
             self._tail.extend(chunk)
@@ -95,9 +107,10 @@ class InFlight:
                 "id": self.id,
                 "model": self.model,
                 "backend": self.backend,
-                "stream": self.stream,
+                "stream": self.stream, 'phase': self.phase,
                 "context_chars": self.context_chars,
-                "elapsed_s": round(elapsed, 2),
+                'elapsed_s': round(elapsed, 2),
+                'queue_s': round(self.queue_s if self.queue_s is not None else elapsed, 3),
                 "ttft_s": round(ttft, 3) if ttft is not None else None,
                 "bytes": self.bytes,
                 "sse_events": self.sse_events,
@@ -192,7 +205,8 @@ class StatsCollector:
             "status": status,
             "disconnected": disconnected,
             "error": error,
-            "elapsed_s": round(elapsed, 3),
+            'elapsed_s': round(elapsed, 3),
+            'queue_s': round(inflight.queue_s if inflight.queue_s is not None else elapsed, 3),
             "ttft_s": round(inflight.first_byte_at - inflight.started_monotonic, 3) if inflight.first_byte_at else None,
             "context_chars": inflight.context_chars,
             "prompt_tokens": prompt,

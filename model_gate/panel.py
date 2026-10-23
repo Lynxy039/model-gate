@@ -14,9 +14,7 @@ import json
 import os
 import re
 import select
-import shlex
 import shutil
-import signal
 import struct
 import subprocess
 import sys
@@ -173,9 +171,11 @@ def build_targets(state: dict) -> list[dict]:
     # порядок обхода j/k = порядок отрисовки: боксы отсортированы по имени
     for backend in sorted((state.get("gate_status") or {}).get("backends", []),
                           key=lambda b: b["name"]):
-        managed = backend.get("process") is not None
-        targets.append({"kind": "backend", "backend": backend["name"], "managed": managed,
-                        "label": f"backend {backend['name']}", "keys": "s K" if managed else "o"})
+        managed = backend.get('process') is not None
+        caps = backend.get('capabilities', {})
+        keys = ('s ' if caps.get('stop', managed) else '') + ('K' if caps.get('clear_kv', managed) else '')
+        targets.append({'kind': 'backend', 'backend': backend['name'], 'managed': managed,
+                        'label': f"backend {backend['name']}", 'keys': keys.strip()})
         for model in backend.get("models", []):
             targets.append({"kind": "model", "backend": backend["name"], "id": model["id"],
                             "label": f"model {model['id'][:30]} ({backend['name']})", "keys": "m"})
@@ -225,29 +225,7 @@ class Actions:
         self._run(f"warmup {model[:24]}", lambda: self._warm_request(model))
 
     def restart_gate(self) -> None:
-        """Перезапуск гейта через mgrun: остановка, старт и ожидание /healthz живут там.
-
-        Отдельной сессией: панель не ребёнок гейта и переживёт его, а mgrun
-        пропишет свежий pid-файл, пока панель продолжает опрашивать. Живой
-        запрос при этом обрывается — гейт гасит бэкенды при остановке.
-        """
-        script = Path(__file__).resolve().parents[1] / "mgrun"
-
-        def call():
-            self._require_local_gate()
-            if not self.config and self.gate_url != "http://127.0.0.1:9000":
-                raise RuntimeError("restart requires --config for a non-default gate URL")
-            command = [sys.executable, str(script), "--restart-gate"]
-            if self.config:
-                command += ["--config", self.config]
-            log_dir = Path.home() / ".local" / "state" / "mgpan"
-            log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(log_dir / "restart.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "ab", buffering=0) as log:
-                subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 start_new_session=True)
-            return "waiting for /healthz"
-        self._run("restart gate", call)
+        self._run('restart gate', lambda: post_json(f'{self.gate_url}/admin/shutdown', {'restart': True}))
 
     def clear_kv(self, backend: str, model: str | None) -> None:
         """Чистка дискового KV-кэша ds4: сервер обязан быть остановлен
@@ -270,50 +248,14 @@ class Actions:
     def cancel(self, request_id: int) -> None:
         self._run(f"cancel #{request_id}", lambda: post_json(f"{self.gate_url}/admin/cancel", {"id": request_id}))
 
-    def _require_local_gate(self) -> None:
-        if urlsplit(self.gate_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
-            raise RuntimeError("this action controls local processes; remote gate is not supported")
-
-    def omlx_restart(self, cli: str) -> None:
-        def call():
-            self._require_local_gate()
-            subprocess.run(shlex.split(cli) + ["restart"], capture_output=True,
-                           text=True, timeout=180, check=True)
-        self._run("omlx restart", call)
-
-    def stop_gate(self, pid_file: str = "/tmp/model-gate.pid") -> None:
-        def call():
-            self._require_local_gate()
-            pid = int(Path(pid_file).read_text().strip())
-            if pid <= 1:
-                raise ValueError("invalid gate PID")
-            command = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                                     capture_output=True, text=True, timeout=5).stdout
-            if "-m model_gate" not in command:
-                raise RuntimeError("PID file does not point to model-gate")
-            os.kill(pid, signal.SIGTERM)
-        self._run("stop gate", call)
+    def stop_gate(self) -> None:
+        self._run('stop gate', lambda: post_json(f'{self.gate_url}/admin/shutdown', {}))
 
     def emergency(self) -> None:
-        """Один удар вместо x,x,s: снять живые запросы и погасить бэкенды.
+        self._run('halt', lambda: post_json(f'{self.gate_url}/admin/halt', {}, timeout=180))
 
-        Отмена идёт первой — нагрузка на GPU падает сразу, а graceful стоп
-        бэкенда ещё и сбрасывает KV на диск десятки секунд.
-        """
-        def call():
-            stats = fetch_json(f"{self.gate_url}/admin/stats")
-            ids = [entry["id"] for entry in stats.get("inflight", [])]
-            for request_id in ids:
-                try:
-                    post_json(f"{self.gate_url}/admin/cancel", {"id": request_id})
-                except Exception:  # noqa: BLE001 — запрос мог уже завершиться
-                    pass
-            status = fetch_json(f"{self.gate_url}/admin/status")
-            stopped = [b["name"] for b in status.get("backends", []) if b.get("process")]
-            for backend in stopped:
-                post_json(f"{self.gate_url}/admin/stop", {"backend": backend}, timeout=150)
-            return f"cancelled {len(ids)} · stopped {' '.join(stopped) or '—'}"
-        self._run("emergency", call)
+    def resume(self) -> None:
+        self._run('resume', lambda: post_json(f'{self.gate_url}/admin/resume', {}))
 
 
 def fmt_n(value: float | int | None) -> str:
@@ -396,49 +338,6 @@ def read_cpu_busy() -> float | None:
         return 100.0 - float(samples[-1]) if samples else None
     except (subprocess.TimeoutExpired, ValueError, IndexError):
         return None
-
-
-def read_process_rss(patterns: dict[str, str]) -> dict[str, int]:
-    raw = subprocess.run(["ps", "-axo", "rss=,comm="], capture_output=True, text=True).stdout
-    result = {name: 0 for name in patterns}
-    for line in raw.splitlines():
-        parts = line.strip().split(" ", 1)
-        if len(parts) != 2:
-            continue
-        rss, comm = parts
-        for name, needle in patterns.items():
-            if needle.lower() in comm.lower():
-                result[name] += int(rss) * 1024
-    return result
-
-
-def read_kv_dir() -> tuple[str, int | None] | None:
-    """--kv-disk-dir и лимит из командной строки живого ds4-server."""
-    raw = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
-    for line in raw.splitlines():
-        cmd = line.strip()
-        # бинарник обязан стоять в начале ps-строки (реальный запуск), иначе
-        # поймаем любой процесс, у которого этот текст затесался в аргументах
-        if not cmd.startswith("/") or "/ds4-server" not in cmd.split(" ", 1)[0]:
-            continue
-        match = re.search(r"--kv-disk-dir (\S+)", cmd)
-        if not match:
-            continue
-        cap = re.search(r"--kv-disk-space-mb (\d+)", cmd)
-        return match.group(1), int(cap.group(1)) * 1024 * 1024 if cap else None
-    return None
-
-
-def dir_size(path: str) -> int:
-    total = 0
-    with os.scandir(path) as entries:
-        for entry in entries:
-            try:
-                if entry.is_file(follow_symlinks=False):
-                    total += entry.stat(follow_symlinks=False).st_size
-            except OSError:
-                pass
-    return total
 
 
 # ---------------------------------------------------------------- poller
@@ -633,29 +532,24 @@ class Poller(threading.Thread):
                 self.state["gate_error"] = str(error)
         if cycle % 2 == 0:
             try:
-                omlx = fetch_json(f"{self.omlx_url}/admin/api/stats")
+                telemetry = fetch_json(f'{self.gate_url}/admin/telemetry')
                 with self.lock:
-                    self.state["omlx"], self.state["omlx_error"] = omlx, ""
+                    self.state['telemetry'] = telemetry
+                    self.state['omlx'] = next((item.get('metrics') for item in telemetry.values() if item.get('kind') == 'omlx'), {}) or {}
+                    self.state['kv_disk'] = next((item.get('kv_disk') for item in telemetry.values() if item.get('kv_disk')), None)
+                    self.state['rss'] = {name: item.get('rss_bytes') for name, item in telemetry.items()}
             except (URLError, OSError, ValueError):
                 with self.lock:
                     self.state["omlx_error"] = "unavailable"
             try:
                 with self.lock:
                     self.state["sys"] = read_vm_stat()
-                    self.state["rss"] = read_process_rss({"ds4": "ds4-server", "omlx": "omlx"})
                     self.state["hist"]["mem"].append(self.state["sys"].get("mem_frac"))
                 pool = (self.state.get("omlx") or {}).get("active_models", {})
                 if pool.get("model_memory_max"):
                     self.state["hist"]["pool"].append(pool["model_memory_used"] / pool["model_memory_max"])
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
-        if cycle % 3 == 0:  # каталог KV-кэша: путь ловим один раз, размер — периодически
-            self._kv_dir = read_kv_dir()
-            if self._kv_dir:
-                path, cap = self._kv_dir
-                used = dir_size(path)
-                with self.lock:
-                    self.state["kv_disk"] = {"path": path, "bytes": used, "cap": cap}
         cpu = read_cpu_busy()
         with self.lock:
             self.state["cpu"] = cpu
@@ -777,10 +671,9 @@ def header_section(state: dict, width: int, sel: dict | None = None) -> list[lis
         # спиннер крутится, фаза подсвечена: prefill оранжевый (GPU пашет), генерация розовая
         segs: list[Seg] = [("▸" if cursor else " ", "live"), (f" {spinner} ", "live"),
                            (f"{entry['model'][:24]}", "fg"), ("  ", "")]
-        if ttft:
-            segs.append(("gen", "live"))
-        else:
-            segs.append(("prefill", "orange"))
+        phase = entry.get('phase', 'streaming' if ttft else 'prefill')
+        phase_label = {'queued': 'queue', 'loading': 'load', 'prefill': 'prefill', 'streaming': 'gen'}.get(phase, phase)
+        segs.append((phase_label, 'warn' if phase == 'queued' else 'live' if phase == 'streaming' else 'orange'))
         segs += [(f" {elapsed:.1f}s", "dim"), ("  ", "")]
         if ttft:
             segs.append((f"{approx} tok", "fg"))
@@ -917,7 +810,9 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
         if process.get("pid"):
             head.append((f" pid {process['pid']}", "dim"))
         inner: list[list[Seg]] = [head]
-        if name == "omlx" and omlx:
+        runtime = (state.get('telemetry') or {}).get(name, {})
+        omlx = runtime.get('metrics') or (omlx if name == 'omlx' else {})
+        if backend.get('kind') == 'omlx' and omlx:
             inner.append([("prefill {} · gen {} t/s".format(omlx.get("avg_prefill_tps", "?"), omlx.get("avg_generation_tps", "?")), "orange")])
             inner.append([("cache {}% · up {}".format(omlx.get("cache_efficiency", "?"), fmt_g(omlx.get("uptime_seconds"))), "dim")])
         else:
@@ -940,7 +835,7 @@ def backends_section(state: dict, width: int, sel: dict | None = None,
             if prompt:
                 tail.append((f"cache {100 * cached / prompt:.0f}%", "dim"))
             # KV-кэш на диске — добро ds4; предупреждаем, когда каталог подпёр к лимиту
-            kv = state.get("kv_disk") or {} if name == "ds4" else {}
+            kv = runtime.get('kv_disk') or {}
             if kv.get("bytes") is not None:
                 used_g = kv["bytes"] / 2**30
                 cap_g = kv["cap"] / 2**30 if kv.get("cap") else None
@@ -1167,7 +1062,8 @@ def compact_header_section(state: dict, width: int, sel: dict | None = None) -> 
         cursor = sel and sel["kind"] == "inflight" and sel["id"] == entry["id"]
         segs: list[Seg] = [("▸" if cursor else " ", "live"), (f"{spinner} ", "live"),
                            (f"{entry['model'][:12]} ", "fg"),
-                           ("gen" if ttft else "pre", "live" if ttft else "orange"),
+                           ({'queued': 'q', 'loading': 'load', 'prefill': 'pre', 'streaming': 'gen'}.get(entry.get('phase'), 'gen' if ttft else 'pre'),
+                            'warn' if entry.get('phase') == 'queued' else 'live' if ttft else 'orange'),
                            (f" {elapsed:.0f}s", "dim")]
         if tps:
             segs.append((f" {tps:.0f}t/s", "orange"))
@@ -1313,7 +1209,7 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
         footer = f"{'⚡' + status + ' · ' if status else ''}q Q X r R p T ↑↓ PgUp c{hint}"
     else:
         footer = (f"{'⚡ ' + status + ' · ' if status else ''}q quit · Q stop gate · R restart gate"
-                  f" · r reload · X kill load · p pause · T theme · ↑/↓ select · PgUp/PgDn log{hint}")
+                  f" · r reload · X halt · u resume · p pause · T theme · ↑/↓ select · PgUp/PgDn log{hint}")
     tty_.paint(lines, footer[:width - 1])
 
 
@@ -1330,16 +1226,21 @@ def main() -> None:
     global BORDER
     parser = argparse.ArgumentParser(description="model-gate monitoring panel")
     parser.add_argument("--url", default=os.environ.get("MODEL_GATE_URL", "http://127.0.0.1:9000"))
-    parser.add_argument("--omlx-url", default="http://127.0.0.1:8001")
+    parser.add_argument('--omlx-url', default='', help=argparse.SUPPRESS)
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True,
                         help="real GPU%% via sudo powermetrics (по умолчанию вкл; --no-gpu выключает)")
     parser.add_argument("--compact", action="store_true",
                         help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
     parser.add_argument("--once", action="store_true", help="single frame to stdout, no TUI")
-    parser.add_argument("--config", help="gate config used by R (passed through mgrun)")
+    parser.add_argument('--config', help='configuration file used to resolve the gate URL')
     parser.add_argument("--theme", default="",
                         help=f"палитра ({', '.join(THEMES)}); по умолчанию — последняя выбранная по T")
     args = parser.parse_args()
+    if args.config:
+        from .config import load_config
+        gate_config = load_config(args.config)
+        host, port = gate_config.get('listen', '127.0.0.1:9000').rsplit(':', 1)
+        args.url = f'http://{host}:{port}'
     if args.theme:
         apply_theme(args.theme)
 
@@ -1354,7 +1255,7 @@ def main() -> None:
                 print("sudo denied — GPU%% stays off")
                 args.gpu = False
 
-    poller = Poller(args.url, args.omlx_url, args.gpu)
+    poller = Poller(args.url, args.omlx_url or args.url, args.gpu)
     if args.once:
         thread = threading.Thread(target=poller.run, daemon=True)
         thread.start()
@@ -1423,16 +1324,15 @@ def main() -> None:
                 actions.clear_kv(sel["backend"], warm_model)
             elif key == "x" and sel and "x" in sel["keys"]:
                 actions.cancel(sel["id"])
-            elif key == "o" and sel and "o" in sel["keys"]:
-                cli = (state.get("omlx") or {}).get("cli_prefix") or "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
-                actions.omlx_restart(cli)
             elif key == "w":
                 # греть можно только цель local-auto: прогрев другой модели выгрузит её
                 target_model = (state.get("gate_status") or {}).get("selected")
                 if target_model:
                     actions.warm(target_model)
-            elif key == "X":
+            elif key == 'X':
                 actions.emergency()
+            elif key == 'u':
+                actions.resume()
             elif key == "Q":
                 actions.stop_gate()
             elif key == "R":

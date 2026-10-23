@@ -9,8 +9,9 @@ inference-серверами и отдаёт клиенту один алиас 
 
 ## Требования и границы
 
-- Python **3.11+**. Proxy работает на Linux/macOS; системные метрики панели
-  (`vm_stat`, `top`, `ioreg`, `powermetrics`) рассчитаны на **macOS**.
+- **macOS**, Python **3.11+**. Основной профиль — Apple Silicon с 128 GiB unified memory;
+  конфигурация не требует именно 128 GiB и не обещает, что любая модель/context поместится.
+  GPU/RAM/CPU telemetry и управляемые DS4 процессы ориентированы на macOS.
 - Это инструмент для одного пользователя в доверенной локальной сети,
   **не публичный API-сервис**. Аутентификации inference-запросов нет:
   `apiKey: "none"` у клиента — заглушка, а не защита. См. [SECURITY.md](SECURITY.md).
@@ -21,27 +22,37 @@ inference-серверами и отдаёт клиенту один алиас 
   модели он не обнаруживает и не выгружает автоматически. Не обходите proxy
   прямыми запросами к backend-ам.
 
-## Запуск
+## Установка и первый запуск
+
+Только runtime stdlib, установка через `pipx`:
 
 ```bash
-cp model-gate.example.json model-gate.json
-# Замените имена моделей, пути команд и load/unload URL на реальные.
-python3.11 -m model_gate --config model-gate.json
+brew install pipx && pipx ensurepath
+pipx install .
+model-gate setup       # пошаговый мастер DS4/oMLX, JSON сохраняется в Application Support
+model-gate doctor      # схема, бинарники/файлы, порт gate, доступность oMLX, профиль RAM
+mgrun --no-gpu         # gate + TUI; отдельные внутренние backend-порты не нужны клиентам
 ```
 
-Личный `model-gate.json`, логи и `reports/` исключены из Git. Пример конфига
-показывает два способа управления:
+Конфиг также можно редактировать вручную; схема — `model-gate.schema.json`.
+`model-gate setup --config PATH` создаёт экземпляр с отдельным состоянием. `mgrun`
+создаёт базовую конфигурацию мастером при первом запуске.
 
-- **Resident backend**: уже работающий сервер, модели загружаются/выгружаются
-  через `load_url`, `unload_url` или `unload_all_url`. Контракт этих endpoint-ов
-  зависит от сервера; пример URL соответствует oMLX. Endpoint должен отвечать
-  только после завершения операции.
-- **Managed backend**: `model_commands` выбирает команду по точному имени модели.
-  Гейт запускает её, ждёт `ready_path`, при смене модели останавливает старый
-  процесс **до загрузки нового**, в том числе при переходе на другой backend.
-  `autostart_command` задаёт общую команду вместо отдельных команд моделей.
-  Запускайте сам бинарник; shell-обёртка должна делать `exec`, чтобы сигналы
-  остановки доходили до inference-сервера.
+Личный config/logs/cache/state не хранятся в репозитории. Пример содержит DS4 и
+resident oMLX. Backend типы:
+
+- **`ds4`** — GGUF path и параметры модели; gate запускает процесс и выбирает
+  случайный свободный loopback порт (или фиксированный override), проверяет readiness.
+- **`omlx`** — уже работающий inference-сервис, модели загружаются/выгружаются
+  через его admin API; адрес задаётся в одном конфиге.
+- **`process`** — собственная managed-команда с `{port}` и списком models.
+- **`http`** — работающий OpenAI-compatible сервер. Custom backend-ы подключаются
+  одним из этих двух режимов без plugin-framework.
+
+При переключении gate останавливает DS4 до загрузки следующей модели или вызывает
+unload hook у resident backend. Если managed endpoint уже занят внешним процессом,
+gate отказывается его усыновлять/останавливать. Unload/load hooks должны завершаться
+лишь после фактической операции.
 
 Модели из `models` и ключей `model_commands` маршрутизируются по точному имени;
 `prefixes` — отдельно, по самому длинному совпадению. Имена моделей между
@@ -65,8 +76,8 @@ curl http://127.0.0.1:9000/v1/chat/completions \
 Клиенту достаточно `base_url=http://127.0.0.1:9000/v1` и `model=local-auto`.
 Цель выбирается клавишей `m` в панели или `POST /admin/select {"model":"..."}`.
 `auto_model` — начальный выбор; последний выбор сохраняется в
-`/tmp/model-gate.selected`. Этот файл и PID launcher-а общие для одного
-экземпляра гейта на машине.
+`~/Library/Application Support/model-gate/instances/<config-id>/selected`.
+PID-файл не используется; lock, selected state и cache разделены по пути config.
 
 `GET /v1/models` возвращает **только `local-auto`**, выбранную модель в `selected`
 и контекст из metadata backend-а либо `--ctx`. Если контекст неизвестен,
@@ -107,17 +118,18 @@ KV-кэш сохраняет префиксы между запросами/пе
 ./mgrun                 # запустить gate, если нужно, затем открыть панель
 ./mgrun --no-gpu        # без sudo/powermetrics
 ./mgrun --compact       # узкий режим; автоматически при ширине <80
-./mgrun --stop          # SIGTERM и ожидание остановки
+./mgrun --stop          # graceful shutdown через gate API
 ./mgpan                 # подключиться к уже работающему gate
 ./mgpan --theme nord    # палитра на этот запуск
 ./mgpan --once --no-gpu # один текстовый кадр, без интерактивного sudo
 ```
 
-Launcher оставляет gate независимым от терминала, пишет лог в `model-gate.log`
-и PID в `/tmp/model-gate.pid`. Параллельные запуски `mgrun` сериализуются.
-`q` закрывает только панель; `Q` останавливает gate. `R` использует конфиг,
-переданный из `mgrun`; для нестандартного URL передайте панели `--config`.
-Локальные process-команды `Q`/`R`/`o` недоступны при удалённом `--url`.
+Launcher оставляет gate независимым от терминала; per-config лог находится в
+`~/Library/Logs/model-gate/`, состояние и lock — в `~/Library/Application Support/model-gate/`.
+Параллельные старты одного config сериализуются; разные конфиги имеют отдельное
+состояние. `q` закрывает только панель; `Q` просит gate о graceful shutdown.
+`R` просит тот же gate перечитать config и перезапуститься. Управление панелью —
+только через API, без `ps`, PID или `omlx-cli`.
 
 Raw ANSI, truecolor, лого MG, без curses. `T` листает `gruvbox`, `catppuccin`
 (Mocha), `tokyo-night`, `nord`, `dracula`. Выбор сохраняется в
@@ -134,13 +146,13 @@ Raw ANSI, truecolor, лого MG, без curses. `T` листает `gruvbox`, `
 | `↑`/`↓`, `j`/`k` | Навигация по LIVE, backend-ам и моделям |
 | `m` | Выбрать модель и дождаться 1-token warmup |
 | `w` | Прогреть текущую цель `local-auto` |
-| `s` | Остановить управляемый backend; при активных запросах — HTTP 409, сначала `x` |
+| `s` | Выгрузить/остановить backend; при активных запросах — HTTP 409, сначала `x` |
 | `K` | Остановить backend, удалить обычные `*.kv` из его каталога, прогреть цель; при активном inference — 409 |
 | `x` | Отменить запрос под курсором |
-| `X` | Отменить текущие запросы, затем попытаться остановить управляемые backend-ы; не запрещает новые запросы клиентов |
-| `o` | Локальная команда `omlx-cli restart` (не admin API) |
-| `r` / `R` | Перезагрузить панель / перезапустить gate; `R` обрывает запросы |
+| `X` | Halt: закрыть очередь, отменить запросы и остановить/unload backend-ы |
+| `r` / `R` | Перезагрузить панель / graceful restart gate |
 | `Q` / `q` | Остановить gate / выйти из панели |
+| `u` | Resume после halt |
 | `T`, `c`, `p` | Палитра / компактный режим / заморозить отрисовку (опрос продолжается) |
 | `PgUp`/`PgDn` | История RECENT |
 
@@ -170,11 +182,13 @@ browser Origin-запросы отклоняются. Это защита от �
 | Метод | Endpoint | Назначение |
 |---|---|---|
 | GET | `/healthz`, `/status` | Жив ли gate, допуск/очередь; не гарантия готовности модели |
-| GET | `/admin/status`, `/admin/stats` | Backend-ы/выбор и статистика |
+| GET | `/admin/status`, `/admin/stats`, `/admin/telemetry` | Состояния/очередь, статистика и backend-метрики через gate |
 | POST | `/admin/select` | `{"model":"..."}` — сменить цель без warmup |
 | POST | `/admin/cancel` | `{"id":N}` — отменить текущий запрос |
 | POST | `/admin/stop` | `{"backend":"..."}` — остановить управляемый процесс |
 | POST | `/admin/clear-kv` | `{"backend":"..."}` — остановка и чистка KV под блокировкой допуска |
+| POST | `/admin/halt`, `/admin/resume` | Закрыть/открыть допуск; halt отменяет очередь и останавливает backend-ы |
+| POST | `/admin/shutdown` | Graceful stop; `{"restart":true}` перечитывает config и exec-ит gate
 
 KV-каталоги содержат текст промптов и состояние модели: не публикуйте их и
 не удаляйте файлы при работающем сервере. `K` удаляет только обычные `.kv`,

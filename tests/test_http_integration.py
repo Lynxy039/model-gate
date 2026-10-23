@@ -14,7 +14,12 @@ class FakeBackend(BaseHTTPRequestHandler):
 
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        scenario = payload.get("scenario")
+        scenario = payload.get('scenario')
+        if scenario == 'quiet-headers':
+            self.server.blocked_started.set()
+            self.server.blocked_release.wait(3)
+            self.close_connection = True
+            return
         if scenario == "quiet-stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -67,6 +72,8 @@ class HttpIntegrationTests(unittest.TestCase):
         cls.backend = ThreadingHTTPServer(("127.0.0.1", 0), FakeBackend)
         cls.backend.stream_started = threading.Event()
         cls.backend.stream_release = threading.Event()
+        cls.backend.blocked_started = threading.Event()
+        cls.backend.blocked_release = threading.Event()
         threading.Thread(target=cls.backend.serve_forever, daemon=True).start()
         with patch.object(GateServer, "_load_selected", return_value=""):
             cls.gate = GateServer(("127.0.0.1", 0), ProxyHandler, {
@@ -101,6 +108,23 @@ class HttpIntegrationTests(unittest.TestCase):
     def wait_idle(self):
         with self.gate.gate._condition:
             self.assertTrue(self.gate.gate._condition.wait_for(lambda: not self.gate.gate._active, timeout=1))
+
+    def test_admin_halt_rejects_requests_until_explicit_resume(self):
+        status, body = self.request({}, '/admin/halt')
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['halted'])
+        try:
+            status, _ = self.request({'model': 'example'})
+            self.assertEqual(status, 503)
+            status, body = self.request({}, '/admin/resume')
+            self.assertEqual(status, 200)
+            self.assertFalse(json.loads(body)['halted'])
+            status, _ = self.request({'model': 'example'})
+            self.assertEqual(status, 200)
+        finally:
+            if self.gate.gate.snapshot()['halted']:
+                self.request({}, '/admin/resume')
+        self.wait_idle()
 
     def test_backend_429_is_not_replaced_with_502(self):
         status, body = self.request({"model": "example", "scenario": "busy"})
@@ -141,6 +165,38 @@ class HttpIntegrationTests(unittest.TestCase):
         self.wait_idle()
         record = next(item for item in self.gate.stats.snapshot()["recent"] if item["disconnected"])
         self.assertEqual(record["status"], 0)
+
+    def test_disconnect_before_upstream_headers_releases_admission(self):
+        connection = http.client.HTTPConnection('127.0.0.1', self.gate.server_port, timeout=3)
+        self.backend.blocked_started.clear()
+        self.backend.blocked_release.clear()
+        old_timeout = self.gate.upstream_timeout
+        self.gate.upstream_timeout = 5
+        try:
+            connection.request('POST', '/v1/chat/completions', json.dumps({'model': 'example', 'scenario': 'quiet-headers'}),
+                               {'Content-Type': 'application/json'})
+            self.assertTrue(self.backend.blocked_started.wait(1))
+            connection.close()
+            with self.gate.gate._condition:
+                self.assertTrue(self.gate.gate._condition.wait_for(lambda: not self.gate.gate._active, timeout=.8))
+        finally:
+            connection.close()
+            self.backend.blocked_release.set()
+            self.gate.upstream_timeout = old_timeout
+
+    def test_queued_disconnected_client_is_removed_without_loading(self):
+        held = self.gate.gate.acquire('test', 'held')
+        connection = http.client.HTTPConnection('127.0.0.1', self.gate.server_port, timeout=3)
+        try:
+            connection.request('POST', '/v1/chat/completions', json.dumps({'model': 'example'}), {'Content-Type': 'application/json'})
+            with self.gate.gate._condition:
+                self.assertTrue(self.gate.gate._condition.wait_for(lambda: len(self.gate.gate._queue) == 1, timeout=1))
+            connection.close()
+            with self.gate.gate._condition:
+                self.assertTrue(self.gate.gate._condition.wait_for(lambda: not self.gate.gate._queue, timeout=1))
+        finally:
+            connection.close()
+            held.release()
 
     def test_truncated_upstream_does_not_get_a_second_json_response(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.gate.server_port, timeout=3)

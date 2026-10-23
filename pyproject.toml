@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-gate"
+version = "0.2.0"
+description = "Local macOS model lifecycle and OpenAI-compatible proxy for DS4 and oMLX"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+classifiers = [
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.scripts]
+model-gate = "model_gate.__main__:main"
+mgpan = "model_gate.panel:main"
+mgrun = "model_gate.launcher:main"
+
+[tool.setuptools.packages.find]
+include = ["model_gate*"]

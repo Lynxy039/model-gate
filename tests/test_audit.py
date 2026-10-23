@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 
 from model_gate import panel
 from model_gate.gate import AdmissionGate
+from model_gate.control import Controller
 from model_gate.proxy import Backend, Lifecycle, LifecycleError, ProcessManager, ProxyHandler
 from model_gate.router import ModelRouter
 from model_gate.stats import StatsCollector
@@ -35,6 +36,9 @@ def handler_for(body=b'{"model":"example"}', path="/v1/chat/completions"):
         lifecycle=Mock(), processes=Mock(), clear_lifecycle_failure=Mock(),
         stats=StatsCollector(), active_requests={}, _active_lock=threading.Lock(),
     )
+    handler.server.lifecycle.snapshot.return_value = {'test': ['example']}
+    handler.server.controller = Controller(handler.server.gate, handler.server.lifecycle,
+        handler.server.processes, handler.server.backends, Mock())
     return handler
 
 
@@ -184,8 +188,9 @@ class HttpAuditTests(unittest.TestCase):
         headers = Message()
         headers["Content-Type"] = "application/json"
         error = HTTPError("http://backend", 429, "busy", headers, io.BytesIO(b'{"error":"busy"}'))
-        with patch("model_gate.proxy.urlopen", side_effect=error):
-            self.assertEqual(handler._forward(handler.server.backends["test"], b"{}"), 429)
+        with patch('model_gate.proxy.http.client.HTTPConnection') as connection:
+            connection.return_value.getresponse.return_value = error
+            self.assertEqual(handler._forward(handler.server.backends['test'], b'{}'), 429)
         self.assertIs(handler._relay.call_args.args[0], error)
 
 
@@ -234,7 +239,7 @@ class MaintenanceAuditTests(unittest.TestCase):
         actions._run = lambda label, call: call()
         with patch("model_gate.panel.post_json", side_effect=lambda url, payload, **kwargs:
                    calls.append((url, payload)) or {"removed": 2, "freed_bytes": 42}), \
-             patch("model_gate.panel.read_kv_dir", side_effect=AssertionError("local filesystem must not be used")):
+             patch('model_gate.panel.Path.unlink', side_effect=AssertionError('local filesystem must not be used')):
             actions.clear_kv("test", "example")
         self.assertEqual(calls[0], ("http://gate/admin/clear-kv", {"backend": "test"}))
         self.assertEqual(calls[1][1]["model"], "local-auto")

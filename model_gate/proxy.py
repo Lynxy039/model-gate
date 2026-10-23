@@ -4,22 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .gate import AdmissionGate, AdmissionPolicy
+from .gate import AdmissionGate, AdmissionPolicy, GateHalted, RequestCancelled
+from .paths import Paths, atomic_write, default_config, instance_lock, private_dir
 from .router import ModelRouter
 from .stats import InFlight, StatsCollector
 
@@ -77,8 +81,12 @@ class Backend:
     autostart_command: list[str] | None = None
     startup_timeout: float = 120
     startup_poll_seconds: float = 1
-    stop_on_proxy_exit: bool = True
     inject_stream_usage: bool = True
+    kind: str = 'http'
+    auto_port: bool = False
+    working_dir: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    unload_timeout: float = 120
 
     @classmethod
     def from_config(cls, name: str, config: dict) -> "Backend":
@@ -104,8 +112,10 @@ class Backend:
             autostart_command=config.get("autostart_command"),
             startup_timeout=float(config.get("startup_timeout", 120)),
             startup_poll_seconds=float(config.get("startup_poll_seconds", 1)),
-            stop_on_proxy_exit=bool(config.get("stop_on_proxy_exit", True)),
             inject_stream_usage=bool(config.get("inject_stream_usage", True)),
+            kind=config.get('kind', 'omlx' if name == 'omlx' else 'http'), auto_port=bool(config.get('auto_port', False)),
+            working_dir=config.get('working_dir'), env=config.get('env', {}),
+            unload_timeout=float(config.get('unload_timeout', 120)),
         )
 
     def admin_url(self, template: str, model: str | None = None) -> str:
@@ -136,6 +146,7 @@ class ProcessManager:
         self._models: dict[str, str | None] = {}
         self._lock = threading.Lock()
         self._closing = False
+        self._last_snapshot = {}
 
     def _pump_log(self, backend_name: str, process: subprocess.Popen) -> None:
         # stderr потомка идёт и в консоль gate (как при ручном запуске), и в
@@ -154,16 +165,23 @@ class ProcessManager:
         except (OSError, TypeError, ValueError):
             return  # pipe закрылся или мок в тестах
 
-    def ensure_ready(self, backend_name: str, model: str | None = None) -> None:
+    def ensure_ready(self, backend_name: str, model: str | None = None, cancelled=lambda: False) -> None:
         backend = self.backends[backend_name]
         command = backend.command_for(model) if model is not None else backend.autostart_command
         if not command:
             return
+        template = command
         with self._lock:
             if self._closing:
                 raise LifecycleError("gate is shutting down")
             restarting = False
             process = self._processes.get(backend_name)
+            if backend.auto_port and (process is None or process.poll() is not None):
+                with socket.socket() as probe:
+                    probe.bind(('127.0.0.1', 0))
+                    backend.base_url = f'http://127.0.0.1:{probe.getsockname()[1]}'
+            port = str(urlsplit(backend.base_url).port or 80)
+            command = [part.replace('{port}', port) for part in template]
             if process is not None and process.poll() is not None:
                 self._processes.pop(backend_name, None)
                 self._commands.pop(backend_name, None)
@@ -177,13 +195,19 @@ class ProcessManager:
                 self._models.pop(backend_name, None)
                 process = None
             if process is None and not restarting and self._ready(backend):
-                if backend.model_commands:
-                    raise LifecycleError(f"{backend_name} is running outside gate; stop it before using model_commands")
-                return
+                raise LifecycleError(f'{backend_name} is running outside gate; stop it before using managed commands')
             if process is None:
                 try:
+                    if '--kv-disk-dir' in command:
+                        private_dir(Path(command[command.index('--kv-disk-dir') + 1]))
+                    options = {}
+                    if backend.working_dir:
+                        options['cwd'] = backend.working_dir
+                    if backend.env:
+                        options['env'] = {**os.environ, **backend.env}
                     process = subprocess.Popen(
                         command,
+                        **options,
                         start_new_session=True,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
@@ -205,13 +229,20 @@ class ProcessManager:
         # Медленное ожидание readiness не должно блокировать snapshot панели.
         deadline = time.monotonic() + backend.startup_timeout
         while time.monotonic() < deadline:
-            if self._closing:
-                raise LifecycleError("gate is shutting down")
+            if self._closing or cancelled():
+                self.stop(backend_name)
+                raise LifecycleError("backend startup cancelled")
             if process.poll() is not None:
-                raise LifecycleError(
-                    f"{backend_name} exited during startup with code {process.returncode}"
-                )
+                self.stop(backend_name)
+                raise LifecycleError(f'{backend_name} exited during startup with code {process.returncode}')
             if self._ready(backend):
+                if backend.auto_port and sys.platform == 'darwin':
+                    owned = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-p', str(process.pid),
+                                            '-iTCP:' + port, '-sTCP:LISTEN'],
+                                           capture_output=True, text=True, timeout=3)
+                    if owned.returncode != 0:
+                        self.stop(backend_name)
+                        raise LifecycleError('auto port is not owned by the launched process')
                 return
             time.sleep(backend.startup_poll_seconds)
         self.stop(backend_name)
@@ -219,23 +250,27 @@ class ProcessManager:
             f"{backend_name} did not become ready within {backend.startup_timeout:g}s"
         )
 
-    def _stop(self, process: subprocess.Popen) -> None:
+    def _stop(self, process: subprocess.Popen, timeout=120) -> None:
         if process.poll() is None:
             process.terminate()
             try:
-                process.wait(timeout=120)
+                process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
 
     def snapshot(self) -> dict[str, dict[str, object]]:
-        with self._lock:
-            return {
-                name: {"running": True, "pid": process.pid, "model": self._models.get(name),
-                      "started_ts": self._started.get(name)}
-                for name, process in self._processes.items()
-                if process.poll() is None
+        if not self._lock.acquire(blocking=False):
+            return dict(self._last_snapshot)
+        try:
+            self._last_snapshot = {
+                name: {'running': True, 'pid': process.pid, 'model': self._models.get(name),
+                       'started_ts': self._started.get(name), 'base_url': self.backends[name].base_url}
+                for name, process in self._processes.items() if process.poll() is None
             }
+            return dict(self._last_snapshot)
+        finally:
+            self._lock.release()
 
     def stop(self, backend_name: str) -> bool:
         with self._lock:
@@ -243,7 +278,7 @@ class ProcessManager:
             if process is None:
                 return False
             # До фактического выхода процесса запрещаем ensure_ready запускать новый.
-            self._stop(process)
+            self._stop(process, self.backends[backend_name].unload_timeout)
             self._processes.pop(backend_name, None)
             self._started.pop(backend_name, None)
             self._commands.pop(backend_name, None)
@@ -256,7 +291,6 @@ class ProcessManager:
             processes = [
                 (name, process)
                 for name, process in self._processes.items()
-                if self.backends[name].stop_on_proxy_exit
             ]
         for name, _ in processes:
             self.stop(name)
@@ -362,6 +396,10 @@ class Lifecycle:
             if unloaded and backend.unload_settle_seconds:
                 self.sleep(backend.unload_settle_seconds)
 
+    def unload_backend(self, backend: str) -> None:
+        with self._lock:
+            self._unload([(backend, model) for model in self._models[backend]], backend)
+
     def forget(self, backend: str) -> None:
         with self._lock:
             self._models[backend].clear()
@@ -420,7 +458,10 @@ class GateServer(ThreadingHTTPServer):
         # модель по умолчанию для алиаса local-auto: выбор из панели (POST /admin/select)
         # переживает рестарт гейта через файл, иначе — auto_model из конфига
         self._selected_lock = threading.Lock()
-        self._selected_file = Path("/tmp/model-gate.selected")
+        self.paths = Paths(Path(config.get('_config_path', default_config())))
+        self.boot_id = uuid.uuid4().hex
+        self._selected_file = self.paths.state / 'selected'
+        self.restart_requested = False
         self.selected = self._load_selected() or str(config.get("auto_model", "")) or None
         if self.selected:
             try:
@@ -438,6 +479,8 @@ class GateServer(ThreadingHTTPServer):
         self._active_lock = threading.Lock()
         self._blocked_until = 0.0
         self._blocked_reason = ""
+        from .control import Controller
+        self.controller = Controller(self.gate, self.lifecycle, self.processes, self.backends, self.cancel_all)
         super().__init__(address, handler)
         self.refresh_models()
 
@@ -470,9 +513,7 @@ class GateServer(ThreadingHTTPServer):
         with self._selected_lock:
             self.selected = model
             try:
-                fd = os.open(self._selected_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-                with os.fdopen(fd, "w") as output:
-                    output.write(model)
+                atomic_write(self._selected_file, model)
             except OSError:
                 pass  # персистентность — удобство, не обязательное условие
 
@@ -516,7 +557,7 @@ class GateServer(ThreadingHTTPServer):
             threading.Thread(target=self.refresh_models, daemon=True).start()
         admission = self.gate.snapshot()
         processes = self.processes.snapshot()
-        loaded = self.lifecycle.snapshot()
+        control = self.controller.snapshot()
         active = admission["models"]
         backends = []
         for name, backend in self.backends.items():
@@ -525,15 +566,24 @@ class GateServer(ThreadingHTTPServer):
             backends.append({
                 "name": name,
                 "ready": self.processes.is_ready(name, timeout=0.2),
-                "process": process,
+                'process': process, 'kind': backend.kind, 'base_url': backend.base_url,
+                **control['states'][name],
+                'capabilities': {'stop': bool(backend.command_for('') or backend.model_commands or backend.unload_url or backend.unload_all_url),
+                                 'clear_kv': any('--kv-disk-dir' in cmd for cmd in [*backend.model_commands.values(), backend.autostart_command or []])},
                 "models": [{
                     "id": model,
                     "active": active.get(f"{name}/{model}", 0),
-                    "loaded": model in loaded[name],
+                    'loaded': control['states'][name]['phase'] == 'ready' and control['states'][name]['model'] == model,
                     "running": bool(process and process["model"] == model),
                 } for model in models],
             })
-        return {**admission, "selected": self.selected, "backends": backends}
+        return {**admission, 'selected': self.selected, 'backends': backends, 'events': control['events']}
+
+    def cancel_all(self):
+        with self._active_lock:
+            requests = list(self.active_requests.values())
+        for handler in requests:
+            handler.cancel()
 
     def lifecycle_available(self) -> tuple[bool, str]:
         with self.state_lock:
@@ -565,12 +615,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if self._admin_allowed():
                 self._json(200, self.server.admin_status())
             return
+        if self.path == '/admin/telemetry':
+            if self._admin_allowed():
+                from .telemetry import collect
+                self._json(200, collect(self.server.backends, self.server.processes.snapshot(), urlopen))
+            return
         if self.path == "/admin/stats":
             if self._admin_allowed():
                 self._json(200, self.server.stats.snapshot())
             return
         if self.path == "/healthz":
-            self._json(200, {"ok": True, **self.server.gate.snapshot()})
+            self._json(200, {'ok': True, 'instance_id': self.server.paths.identity,
+                             'boot_id': self.server.boot_id, **self.server.gate.snapshot()})
             return
         if self.path == "/status":
             self._json(200, self.server.gate.snapshot())
@@ -614,8 +670,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/admin/select":
             self._select_model()
             return
-        if self.path == "/admin/clear-kv":
+        if self.path == '/admin/clear-kv':
             self._clear_kv()
+            return
+        if self.path in ('/admin/halt', '/admin/resume', '/admin/shutdown'):
+            self._control_action()
             return
         # /<backend>/v1/* is a per-backend view: strip the prefix, routing is
         # still by model name (the prefix is for discovery, not access control).
@@ -658,8 +717,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._json(503, {"error": f"model gate is cooling down: {reason}"})
                 return
             backend = self.server.backends[backend_name]
-            lease = self.server.gate.acquire(backend_name, model, backend.admission_policy(model),
-                                             timeout=getattr(self.server, "queue_timeout", 600))
+
         except TimeoutError as error:
             self._json(503, {"error": str(error)})
             return
@@ -681,16 +739,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
         inflight = self.server.stats.start(model, backend_name, stream, context_chars)
         with self.server._active_lock:
             self.server.active_requests[inflight.id] = self
+        lease = None
+        watch_done = threading.Event()
+        watcher = None
+        if isinstance(getattr(self, 'connection', None), socket.socket):
+            watcher = threading.Thread(target=self._watch_disconnect, args=(watch_done,), daemon=True)
+            watcher.start()
         try:
+            lease = self.server.gate.acquire(backend_name, model, backend.admission_policy(model),
+                timeout=getattr(self.server, 'queue_timeout', 600), request_id=inflight.id,
+                cancelled=self._peer_gone)
+            inflight.admit()
             if getattr(self, "_cancelled", False):
                 raise ConnectionResetError("request cancelled")
             if lease.initialize:
-                self.server.lifecycle.activate(backend_name, model)
-                self.server.processes.ensure_ready(backend_name, model)
+                inflight.phase = 'loading'
+                self.server.controller.activate(backend_name, model, cancelled=self._peer_gone)
                 self.server.clear_lifecycle_failure()
                 lease.mark_ready()
             if getattr(self, "_cancelled", False):
                 raise ConnectionResetError("request cancelled during startup")
+            inflight.phase = 'prefill'
             status = self._forward(backend, body, inflight)
             self.server.stats.finish(inflight, status=status)
             LOGGER.info(
@@ -702,20 +771,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 status,
                 time.monotonic() - started,
             )
+        except (RequestCancelled, BrokenPipeError, ConnectionResetError):
+            self.server.stats.finish(inflight, status=0, disconnected=True)
+            self.close_connection = True
+        except GateHalted as error:
+            self.server.stats.finish(inflight, status=503, error=str(error))
+            self._json(503, {'error': str(error)})
+        except TimeoutError as error:
+            if lease is None:
+                self.server.stats.finish(inflight, status=503, error=str(error))
+                self._json(503, {'error': str(error)})
+            else:
+                self.server.stats.finish(inflight, status=502, error=str(error))
+                self._proxy_error(f'upstream timed out: {error}')
         except LifecycleError as error:
+            if self._peer_gone():
+                self.server.stats.finish(inflight, status=0, disconnected=True)
+                return
             self.server.stats.finish(inflight, status=503, error=str(error))
             self.server.block_lifecycle(str(error))
             LOGGER.error("request model=%s backend=%s status=503 error=%s", model, backend_name, error)
             self._json(503, {"error": str(error)})
-        except (BrokenPipeError, ConnectionResetError):
-            self.server.stats.finish(inflight, status=0, disconnected=True)
-            LOGGER.info(
-                "request disconnected model=%s backend=%s stream=%s elapsed=%.3fs",
-                model,
-                backend_name,
-                stream,
-                time.monotonic() - started,
-            )
         except (HTTPError, URLError, OSError) as error:
             if getattr(self, "_cancelled", False):
                 self.server.stats.finish(inflight, status=0, disconnected=True)
@@ -731,11 +807,53 @@ class ProxyHandler(BaseHTTPRequestHandler):
             LOGGER.exception("request model=%s backend=%s status=502", model, backend_name)
             self._proxy_error(f"proxy request failed: {error}")
         finally:
+            watch_done.set()
+            if watcher is not None:
+                watcher.join(timeout=.5)
             with self.server._active_lock:
                 for key, handler in list(self.server.active_requests.items()):
                     if handler is self:
                         self.server.active_requests.pop(key, None)
-            lease.release()
+            if lease is not None:
+                lease.release()
+
+    def _watch_disconnect(self, done):
+        while not done.wait(.1):
+            if self._peer_gone():
+                self.cancel()
+                return
+
+    def _peer_gone(self):
+        if getattr(self, '_cancelled', False):
+            return True
+        connection = getattr(self, 'connection', None)
+        if connection is None:
+            return False
+        try:
+            if select.select([connection], [], [], 0)[0]:
+                return connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b''
+        except (OSError, ValueError):
+            return True
+        return False
+
+    def _control_action(self):
+        if not self._admin_allowed():
+            return
+        try:
+            payload = self._read_json()
+            if self.path == '/admin/halt':
+                self._json(200, self.server.controller.halt())
+            elif self.path == '/admin/resume':
+                self._json(200, self.server.controller.resume())
+            else:
+                restart = payload.get('restart', False)
+                if type(restart) is not bool:
+                    raise ValueError('restart must be boolean')
+                self._json(200, {'ok': True, 'restart': restart})
+                self.server.restart_requested = restart
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+        except ValueError as error:
+            self._json(400, {'error': str(error)})
 
     def _proxy_error(self, message: str) -> None:
         if getattr(self, "_response_started", False):
@@ -766,6 +884,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.connection.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        connection = getattr(self, '_upstream_connection', None)
+        upstream_socket = getattr(connection, 'sock', None)
+        if upstream_socket is not None:
+            try:
+                upstream_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         upstream = getattr(self, "_upstream", None)
         if upstream is not None:
             # close() может ждать блокирующий read1 в другом потоке: сначала shutdown.
@@ -803,15 +928,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(error)})
             return
         try:
-            with self.server.gate.maintenance():
-                if not self.server.processes.stop(backend):
-                    self._json(404, {"error": f"no managed process for backend: {backend}"})
-                    return
-                self.server.lifecycle.forget(backend)
+            self._json(200, self.server.controller.stop(backend))
         except RuntimeError as error:
-            self._json(409, {"error": str(error)})
-            return
-        self._json(200, {"ok": True, "backend": backend})
+            self._json(409, {'error': str(error)})
 
     def _cancel_request(self) -> None:
         if not self._admin_allowed():
@@ -821,6 +940,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as error:
             self._json(400, {"error": f"JSON field 'id' is required: {error}"})
             return
+        self.server.gate.cancel(request_id)
         with self.server._active_lock:
             handler = self.server.active_requests.get(request_id)
         if handler is None:
@@ -837,27 +957,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             name = self._read_json().get("backend")
             if not isinstance(name, str) or name not in self.server.backends:
                 raise ValueError("known JSON field 'backend' is required")
-            backend = self.server.backends[name]
-            removed = freed = 0
-            with self.server.gate.maintenance():
-                process = self.server.processes.snapshot().get(name)
-                if not process:
-                    raise ValueError("KV cleanup requires a managed running backend")
-                command = backend.command_for(process["model"]) or []
-                if "--kv-disk-dir" not in command:
-                    raise ValueError("backend has no --kv-disk-dir")
-                path = Path(command[command.index("--kv-disk-dir") + 1])
-                if not path.is_absolute() or not path.is_dir():
-                    raise ValueError("KV directory must be an existing absolute path")
-                if not self.server.processes.stop(name):
-                    raise RuntimeError("backend already stopped; retry after warmup")
-                self.server.lifecycle.forget(name)
-                for entry in path.iterdir():
-                    if entry.suffix == ".kv" and entry.is_file() and not entry.is_symlink():
-                        freed += entry.stat().st_size
-                        entry.unlink()
-                        removed += 1
-            self._json(200, {"ok": True, "removed": removed, "freed_bytes": freed})
+            self._json(200, self.server.controller.clear_kv(name))
         except (ValueError, IndexError) as error:
             self._json(400, {"error": str(error)})
         except RuntimeError as error:
@@ -893,24 +993,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         skip |= {token.strip().lower() for token in self.headers.get("Connection", "").split(",")}
         request_headers = {key: value for key, value in self.headers.items() if key.lower() not in skip}
         request_headers["Content-Length"] = str(len(body))
-        request = Request(
-            backend.base_url + self.path,
-            data=body,
-            method="POST",
-            headers=request_headers,
-        )
+        url = urlsplit(backend.base_url + self.path)
+        cls = http.client.HTTPSConnection if url.scheme == 'https' else http.client.HTTPConnection
+        connection = cls(url.hostname, url.port, timeout=min(5, self.server.upstream_timeout))
+        self._upstream_connection = connection
         try:
-            response = urlopen(request, timeout=self.server.upstream_timeout)
-        except HTTPError as error:
-            response = error  # сохраняем статус и тело backend-а, а не превращаем всё в 502
-        with response:
-            self._upstream = response  # для отмены из панели (POST /admin/cancel)
-            try:
-                if getattr(self, "_cancelled", False):
-                    raise ConnectionResetError("request cancelled")
+            connection.connect()
+            connection.sock.settimeout(self.server.upstream_timeout)
+            if self._peer_gone():
+                raise RequestCancelled('client disconnected')
+            connection.request('POST', url.path + ('?' + url.query if url.query else ''), body, request_headers)
+            response = connection.getresponse()
+            self._upstream = response
+            with response:
+                if self._peer_gone():
+                    raise RequestCancelled('client disconnected')
                 return self._relay(response, inflight)
-            finally:
-                self._upstream = None
+        finally:
+            self._upstream = None
+            self._upstream_connection = None
+            connection.close()
 
     def _relay(self, response, inflight: "InFlight | None") -> int:
         self._response_started = True
@@ -972,26 +1074,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 def serve(config_path: str | Path) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    config = json.loads(Path(config_path).read_text())
-    listen = config.get("listen", "127.0.0.1:9000")
-    host, port = listen.rsplit(":", 1)
-    server = GateServer((host, int(port)), ProxyHandler, config)
-
-    def terminate(signum, frame):
-        # SIGTERM должен пройти через finally: иначе stop_all не отработает и
-        # ds4 останется сиротой, а новый гейт его лишь "усыновит" без stderr
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGTERM, terminate)
-    print(f"model-gate listening on http://{listen}", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.processes.stop_all()
-        server.server_close()
+    from .config import load_config
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    config = load_config(config_path)
+    for warning in config.get('_warnings', []): LOGGER.warning(warning)
+    paths = Paths(Path(config['_config_path']))
+    with instance_lock(paths.state / 'serve.lock', blocking=False):
+        host, port = config.get('listen', '127.0.0.1:9000').rsplit(':', 1)
+        server = GateServer((host, int(port)), ProxyHandler, config)
+        LOGGER.info('listening on %s:%s instance=%s', host, port, paths.identity)
+        def terminate(signum, frame):
+            threading.Thread(target=server.shutdown, daemon=True).start()
+        signal.signal(signal.SIGTERM, terminate)
+        signal.signal(signal.SIGINT, terminate)
+        try:
+            server.serve_forever()
+        finally:
+            server.controller.halt()
+            server.processes.stop_all()
+            server.server_close()
+        restart = server.restart_requested
+    if restart:
+        os.execv(sys.executable, [sys.executable, '-m', 'model_gate', 'serve', '--config', str(paths.config)])

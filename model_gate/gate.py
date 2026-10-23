@@ -1,73 +1,103 @@
-"""Admission control: в гейте одновременно живёт ровно одна модель."""
-
+"""FIFO admission: one model at a time, cancellable queue and explicit halt."""
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+import itertools
 import threading
 import time
-
+from typing import Callable
 
 ModelKey = tuple[str, str]
+
+
+class RequestCancelled(RuntimeError):
+    pass
+
+
+class GateHalted(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
     max_concurrency: int = 1
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         if self.max_concurrency < 1:
-            raise ValueError("max_concurrency must be positive")
+            raise ValueError('max_concurrency must be positive')
+
+
+@dataclass(eq=False)
+class Waiting:
+    id: int
+    key: ModelKey
+    since: float
+    cancelled: bool = False
 
 
 class Lease:
-    def __init__(self, gate: "AdmissionGate", key: ModelKey, policy: AdmissionPolicy, initialize: bool):
+    def __init__(self, gate, key, policy, initialize):
         self._gate = gate
         self.backend, self.model = key
         self.max_concurrency = policy.max_concurrency
         self.initialize = initialize
         self._released = False
 
-    def mark_ready(self) -> None:
+    def mark_ready(self):
         self._gate._mark_ready((self.backend, self.model))
 
-    def release(self) -> None:
+    def release(self):
         if not self._released:
             self._released = True
-            self._gate._release((self.backend, self.model), self.initialize)
+            self._gate._release((self.backend, self.model))
 
-    def __enter__(self) -> "Lease":
+    def __enter__(self):
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def __exit__(self, *_):
         self.release()
 
 
 class AdmissionGate:
-    """Пропускает запросы только одной модели сразу.
-
-    Локальные серверы не держат две модель в памяти, поэтому «одна модель» —
-    свойство допуска, а не настройка конфига: запрос к другой модели ждёт, пока
-    не освободятся все активные лизы. Запросы к уже активной модели проходят
-    в пределах её ``max_concurrency``. Ожидающие видны в ``snapshot()`` как
-    ``waiting`` — панель показывает их как очередь.
-    """
-
-    def __init__(self, policies: dict[ModelKey, AdmissionPolicy], default: AdmissionPolicy | None = None):
+    def __init__(self, policies, default=None):
         self._policies = policies
         self._default = default or AdmissionPolicy()
         self._condition = threading.Condition()
-        self._active: dict[ModelKey, int] = {}
-        self._ready: set[ModelKey] = set()
-        self._waiting = 0
+        self._active = {}
+        self._ready = set()
+        self._queue: deque[Waiting] = deque()
+        self._ids = itertools.count(-1, -1)
         self._maintenance = False
+        self._halted = False
+
+    def halt(self):
+        with self._condition:
+            self._halted = True
+            for entry in self._queue:
+                entry.cancelled = True
+            self._condition.notify_all()
+
+    def resume(self):
+        with self._condition:
+            self._halted = False
+            self._condition.notify_all()
+
+    def cancel(self, request_id):
+        with self._condition:
+            for entry in self._queue:
+                if entry.id == request_id:
+                    entry.cancelled = True
+                    self._condition.notify_all()
+                    return True
+        return False
 
     @contextmanager
     def maintenance(self):
-        """Не допускаем новые запросы во время остановки и удаления KV."""
         with self._condition:
             if self._maintenance or self._active:
-                raise RuntimeError("gate is busy; cancel active requests before maintenance")
+                raise RuntimeError('gate is busy; cancel active requests before maintenance')
             self._maintenance = True
         try:
             yield
@@ -76,59 +106,63 @@ class AdmissionGate:
                 self._maintenance = False
                 self._condition.notify_all()
 
-    def acquire(self, backend: str, model: str, policy: AdmissionPolicy | None = None,
-                timeout: float = 600) -> Lease:
+    def acquire(self, backend, model, policy=None, timeout=600, *, request_id=None,
+                cancelled: Callable[[], bool] | None = None):
         key = backend, model
         policy = policy or self._policies.get(key, self._default)
         deadline = time.monotonic() + timeout
         with self._condition:
-            self._waiting += 1
+            entry = Waiting(next(self._ids) if request_id is None else request_id, key, time.monotonic())
+            self._queue.append(entry)
+            self._condition.notify_all()
             try:
-                while not self._admissible(key, policy):
+                while True:
+                    if entry.cancelled or (cancelled and cancelled()):
+                        raise RequestCancelled('request cancelled or client disconnected')
+                    if self._halted:
+                        raise GateHalted('gate is halted; resume explicitly before inference')
+                    if self._queue[0] is entry and self._admissible(key, policy):
+                        initialize = key not in self._active
+                        self._active[key] = self._active.get(key, 0) + 1
+                        return Lease(self, key, policy, initialize)
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("admission queue timed out")
-                    self._condition.wait(remaining)
-                initialize = key not in self._active
-                self._active[key] = self._active.get(key, 0) + 1
-                return Lease(self, key, policy, initialize)
+                        raise TimeoutError('admission queue timed out')
+                    self._condition.wait(min(remaining, 0.2))
             finally:
-                self._waiting -= 1
+                self._queue.remove(entry)
+                self._condition.notify_all()
 
-    def _admissible(self, key: ModelKey, policy: AdmissionPolicy) -> bool:
-        if self._maintenance:
-            return False
-        own_active = self._active.get(key, 0)
-        if own_active >= policy.max_concurrency:
-            return False
-        if own_active and key not in self._ready:
-            return False
-        # активны только лизы этой же модели (или никого) — чужая модель = ждём
-        return set(self._active) <= {key}
+    def _admissible(self, key, policy):
+        own = self._active.get(key, 0)
+        return (not self._maintenance and own < policy.max_concurrency
+                and (not own or key in self._ready) and set(self._active) <= {key})
 
-    def _mark_ready(self, key: ModelKey) -> None:
+    def _mark_ready(self, key):
         with self._condition:
             if key not in self._active:
-                raise RuntimeError("invalid lease initialization")
+                raise RuntimeError('invalid lease initialization')
             self._ready.add(key)
             self._condition.notify_all()
 
-    def _release(self, key: ModelKey, initialize: bool) -> None:
+    def _release(self, key):
         with self._condition:
             active = self._active.get(key, 0)
-            if active == 0:
-                raise RuntimeError("invalid or duplicated lease release")
+            if not active:
+                raise RuntimeError('invalid or duplicated lease release')
             if active == 1:
                 del self._active[key]
                 self._ready.discard(key)
             else:
-                self._active[key] = active - 1
+                self._active[key] -= 1
             self._condition.notify_all()
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self):
         with self._condition:
             return {
-                "active": sum(self._active.values()),
-                "models": {f"{backend}/{model}": count for (backend, model), count in self._active.items()},
-                "waiting": self._waiting,
+                'active': sum(self._active.values()),
+                'models': {f'{b}/{m}': count for (b, m), count in self._active.items()},
+                'waiting': len(self._queue), 'halted': self._halted,
+                'queue': [{'id': e.id, 'backend': e.key[0], 'model': e.key[1],
+                           'age_s': round(time.monotonic() - e.since, 2)} for e in self._queue],
             }
