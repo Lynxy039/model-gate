@@ -4,15 +4,21 @@
 
 model-gate is a single-user macOS tool, not an Internet-facing inference service.
 The gate listens only on `127.0.0.1` or `localhost`; schema validation rejects other
-addresses. Inference requests have no authentication, so do not publish the API via
-a reverse proxy, port forwarding, LAN, or Tailscale. Local processes are trusted.
-There is no account/tenant isolation, TLS, or public-service rate limit.
+addresses. Inference requests have no application authentication. Tailnet access is
+supported only by proxying the loopback listener with **Tailscale Serve**, which is
+tailnet-only; never enable Funnel, a public reverse proxy, or a direct non-loopback
+listener. Tailscale ACLs must limit which users/devices can reach Serve. There is no
+account/tenant isolation or public-service rate limit.
 
-The admin API additionally checks the peer loopback address, local Host and browser
-Origin headers. Older unversioned configs with a wildcard gate listener migrate to
-loopback in memory and produce a warning; migration does not overwrite the source.
-Managed DS4 chooses a free port and binds to loopback. Custom process commands must
-also bind their inference listener to loopback.
+The admin API checks the peer loopback address, local Host, and browser Origin. A
+configured `tailscale_readonly_users` allowlist permits only Tailscale Serve identity
+headers for read-only GETs (`/admin/status`, `/admin/stats`, `/admin/telemetry`);
+all mutating admin requests remain local-only. Tailscale Serve removes spoofed
+identity headers before adding the authenticated user identity. Older unversioned
+configs with a wildcard gate listener migrate to loopback in memory and produce a
+warning; migration does not overwrite the source. Managed DS4 chooses a free port
+and binds to loopback. Custom process commands must also bind their inference
+listener to loopback.
 
 ## Trusted inputs and private data
 

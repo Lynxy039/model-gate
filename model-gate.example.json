@@ -3,6 +3,7 @@
   "version": 1,
   "listen": "127.0.0.1:9000",
   "auto_model": "example-model",
+  "tailscale_readonly_users": [],
   "memory_profile_gb": 128,
   "require_unload": true,
   "upstream_timeout": 600,

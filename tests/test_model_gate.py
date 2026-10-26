@@ -242,6 +242,13 @@ class ProxyAdminTests(unittest.TestCase):
 
 
 class PanelActionTests(unittest.TestCase):
+    def test_read_only_panel_does_not_send_mutating_requests(self):
+        actions = Actions("https://gate.tailnet", "", read_only=True)
+        with patch("model_gate.panel.post_json") as post:
+            actions.switch("glm5.3-flash")
+        post.assert_not_called()
+        self.assertIn("read-only", actions.status())
+
     def test_switch_selects_model_then_finishes_warmup_before_reporting_success(self):
         actions = Actions("http://gate", "http://omlx")
         calls = []

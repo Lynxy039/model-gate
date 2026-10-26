@@ -470,6 +470,7 @@ class GateServer(ThreadingHTTPServer):
                 self.selected = str(config.get("auto_model", "")) or None
         self._last_discovery = 0.0
         self.max_body_bytes = int(config.get("max_body_bytes", 64 * 1024 * 1024))
+        self.tailscale_readonly_users = {user.strip().casefold() for user in config.get('tailscale_readonly_users', [])}
         self.upstream_timeout = float(config.get("upstream_timeout", 600))
         self.queue_timeout = float(config.get("queue_timeout", 600))
         self.failure_cooldown = float(config.get("lifecycle_failure_cooldown", 5))
@@ -867,10 +868,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             host = urlsplit("//" + headers.get("Host", "localhost")).hostname
         except ValueError:
             host = None
-        if (self.client_address[0] in {"127.0.0.1", "::1"}
-                and host in {"127.0.0.1", "::1", "localhost"}
+        loopback_peer = self.client_address[0] in {"127.0.0.1", "::1"}
+        if (loopback_peer and host in {"127.0.0.1", "::1", "localhost"}
                 and not headers.get("Origin")
                 and headers.get("Sec-Fetch-Site") not in {"cross-site", "same-site"}):
+            return True
+        tailscale_user = headers.get('Tailscale-User-Login', '').strip().casefold()
+        if (loopback_peer and getattr(self, 'command', '') == 'GET' and tailscale_user
+                and tailscale_user in getattr(self.server, 'tailscale_readonly_users', ())
+                and not headers.get('Origin')
+                and headers.get('Sec-Fetch-Site') not in {'cross-site', 'same-site'}):
             return True
         self._json(403, {"error": "admin API is local only"})
         return False

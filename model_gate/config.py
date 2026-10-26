@@ -45,7 +45,8 @@ ROOT = {'version': {'enum': [1]}, 'listen': STRING, 'auto_model': STRING,
         'upstream_timeout': {'type': 'number', 'exclusiveMinimum': 0},
         'queue_timeout': {'type': 'number', 'exclusiveMinimum': 0},
         'lifecycle_failure_cooldown': SECONDS, 'max_body_bytes': POSITIVE,
-        'model_discovery_timeout': {'type': 'number', 'exclusiveMinimum': 0}}
+        'model_discovery_timeout': {'type': 'number', 'exclusiveMinimum': 0},
+        'tailscale_readonly_users': STRINGS}
 
 
 def schema():

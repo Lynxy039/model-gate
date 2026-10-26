@@ -175,9 +175,9 @@ SSE-событий приблизительные. `ttfb` означает **в�
 
 `POST /v1/*` проксирует JSON-объект с `model`, сохраняет HTTP-ошибки backend-а
 и потоковый ответ. Chunked request bodies не поддерживаются; нужен Content-Length.
-Административные методы доступны только с loopback-адреса и локальным Host,
-browser Origin-запросы отклоняются. Это защита от браузерных запросов/DNS rebinding,
-**не аутентификация локальных процессов**.
+Изменяющие административные методы доступны только локально с loopback и локальным
+Host. Для Tailscale Serve можно отдельно разрешить read-only `GET` по identity header;
+браузерные Origin-запросы отклоняются. Это не заменяет Tailscale ACL.
 
 | Метод | Endpoint | Назначение |
 |---|---|---|
@@ -189,6 +189,36 @@ browser Origin-запросы отклоняются. Это защита от �
 | POST | `/admin/clear-kv` | `{"backend":"..."}` — остановка и чистка KV под блокировкой допуска |
 | POST | `/admin/halt`, `/admin/resume` | Закрыть/открыть допуск; halt отменяет очередь и останавливает backend-ы |
 | POST | `/admin/shutdown` | Graceful stop; `{"restart":true}` перечитывает config и exec-ит gate
+
+### Доступ из tailnet
+
+Gate по-прежнему слушает только `127.0.0.1`; наружу его проксирует **Tailscale Serve**
+(HTTPS, tailnet-only), не прямой bind и не Funnel. На сервере проверьте `tailscale serve status`;
+если Serve ещё не настроен, используйте `tailscale serve --bg 9000`. В конфиге gate явно
+перечислите пользователей, которым разрешено читать статистику:
+
+```json
+"tailscale_readonly_users": ["you@example.com"]
+```
+
+Serve добавляет проверяемый `Tailscale-User-Login`: этим пользователям доступны
+`GET /admin/stats`, `/admin/status`, `/admin/telemetry`; все `POST /admin/*` остаются
+локальными. Inference `POST /v1/*` доступен устройствам, которым tailnet ACL разрешает
+доступ к Serve. Ограничивайте ACL и никогда не включайте Funnel.
+
+На любом устройстве tailnet используйте один и тот же MagicDNS HTTPS URL:
+
+```bash
+export MODEL_GATE_URL="https://<gate-device>.<tailnet-domain>.ts.net"
+mgpan --url "$MODEL_GATE_URL" --read-only
+```
+
+В примере замените placeholder на HTTPS MagicDNS URL из `tailscale serve status`.
+Для Pi задайте provider с `baseUrl: "https://<gate-device>.<tailnet-domain>.ts.net/v1"`,
+`api: "openai-completions"`, `apiKey: "none"` и единственной моделью
+`id: "local-auto"`. Панель получает RAM/CPU/GPU gate-хоста через telemetry, а не
+показывает ресурсы клиентского устройства. Для удалённых URL `mgpan` автоматически
+работает read-only; переключение моделей выполняйте локально.
 
 KV-каталоги содержат текст промптов и состояние модели: не публикуйте их и
 не удаляйте файлы при работающем сервере. `K` удаляет только обычные `.kv`,

@@ -157,6 +157,37 @@ class HttpAuditTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler._json.call_args.args[0], 403)
 
+    def test_allowlisted_tailscale_user_can_read_admin_but_not_write(self):
+        handler = handler_for(path="/admin/stats")
+        handler.command = "GET"
+        handler.headers.replace_header("Host", "gate-device.tailnet.example")
+        handler.headers["Tailscale-User-Login"] = "owner@example.com"
+        handler.server.tailscale_readonly_users = ["owner@example.com"]
+        self.assertTrue(handler._admin_allowed())
+
+        handler.command = "POST"
+        self.assertFalse(handler._admin_allowed())
+        self.assertEqual(handler._json.call_args.args[0], 403)
+
+    def test_other_tailscale_user_cannot_read_admin(self):
+        handler = handler_for(path="/admin/stats")
+        handler.command = "GET"
+        handler.headers.replace_header("Host", "gate-device.tailnet.example")
+        handler.headers["Tailscale-User-Login"] = "shared-user@example.com"
+        handler.server.tailscale_readonly_users = ["owner@example.com"]
+        self.assertFalse(handler._admin_allowed())
+        self.assertEqual(handler._json.call_args.args[0], 403)
+
+    def test_tailnet_identity_header_is_not_trusted_from_non_loopback_peer(self):
+        handler = handler_for(path="/admin/stats")
+        handler.command = "GET"
+        handler.client_address = ("100.64.0.2", 1234)
+        handler.headers.replace_header("Host", "gate-device.tailnet.example")
+        handler.headers["Tailscale-User-Login"] = "owner@example.com"
+        handler.server.tailscale_readonly_users = ["owner@example.com"]
+        self.assertFalse(handler._admin_allowed())
+        self.assertEqual(handler._json.call_args.args[0], 403)
+
     def test_truncated_body_is_rejected(self):
         handler = handler_for()
         handler.headers.replace_header("Content-Length", "999")
@@ -275,6 +306,18 @@ class PanelAuditTests(unittest.TestCase):
              patch("model_gate.panel.os.read", side_effect=[b"\x1b[", b"A"]):
             self.assertIsNone(terminal.key(0))
             self.assertEqual(terminal.key(0), "UP")
+
+    def test_remote_panel_uses_gate_host_telemetry_not_client_machine(self):
+        poller = panel.Poller("https://gate-device.tailnet.example", "", False, remote=True)
+        host = {'kind': 'host', 'sys': {'mem_total': 100, 'mem_used': 70, 'mem_frac': .7},
+                'cpu': 23.0, 'gpu_pct': 44.0, 'gpu_temp': 61.0, 'sys_watts': 38.0}
+        with patch('model_gate.panel.fetch_json', side_effect=[{}, {}, {'_host': host}]), \
+                patch('model_gate.panel.read_vm_stat', side_effect=AssertionError('must use gate host')), \
+                patch('model_gate.panel.read_cpu_busy', side_effect=AssertionError('must use gate host')):
+            poller._sample(0)
+        self.assertEqual(poller.state['sys'], host['sys'])
+        self.assertEqual(poller.state['cpu'], 23.0)
+        self.assertEqual(poller.state['gpu_temp'], 61.0)
 
     def test_three_backends_fit_inside_their_outer_box(self):
         state = panel.Poller("http://gate", "http://omlx", False).state

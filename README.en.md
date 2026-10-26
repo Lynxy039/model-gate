@@ -4,7 +4,7 @@ A local OpenAI-compatible proxy and model lifecycle controller for **macOS**, fo
 
 - Python 3.11+, runtime standard library only.
 - 128 GiB unified memory is the reference profile, not a hardware requirement or a promise that every model/context fits.
-- No inference API authentication: keep the listener on loopback and do not expose it to LAN, Tailscale, or the Internet.
+- No inference API authentication: keep the listener on loopback. Tailnet access is supported only through Tailscale Serve (never Funnel), with tailnet ACLs.
 - DS4 binds to a free loopback port by default; fixed port override is available in JSON.
 - Config is versioned JSON and is the single source of truth. `setup` is the first-run wizard; edit JSON directly for custom backends.
 
@@ -50,7 +50,26 @@ Use `base_url=http://127.0.0.1:9000/v1` and `model=local-auto`. Select a target 
 - `POST /admin/halt` / `/admin/resume` — close/reopen admission; halt cancels queued work and stops/unloads backends
 - `POST /admin/shutdown` — graceful stop; `{"restart":true}` reloads config and execs the gate
 
-All admin methods are loopback-only. Halt is reversible with resume; a client disconnect cancels its request without turning the backend failure count into an error.
+Mutating admin methods are loopback-only. Read-only admin GETs can be allowed for named Tailscale users using Serve identity headers. Halt is reversible with resume; a client disconnect cancels its request without turning the backend failure count into an error.
+
+## Tailscale access
+
+Keep the gate bound to `127.0.0.1` and proxy it with **Tailscale Serve** (tailnet-only HTTPS); do not use Funnel. Verify with `tailscale serve status`, or configure with `tailscale serve --bg 9000`. Add an explicit read-only user allowlist to gate config:
+
+```json
+"tailscale_readonly_users": ["you@example.com"]
+```
+
+That user can read `/admin/stats`, `/admin/status`, and `/admin/telemetry`; remote POST admin actions remain blocked. Inference requests are available only to tailnet peers allowed by Tailscale ACLs.
+
+On any tailnet device:
+
+```bash
+export MODEL_GATE_URL="https://<gate-device>.<tailnet-domain>.ts.net"
+mgpan --url "$MODEL_GATE_URL" --read-only
+```
+
+Replace the placeholder in the example with the HTTPS MagicDNS URL shown by `tailscale serve status`. For Pi, configure an `openai-completions` provider at `https://<gate-device>.<tailnet-domain>.ts.net/v1`, with `apiKey: "none"` and model ID `local-auto`. Remote `mgpan` reads system telemetry from the gate host, not the client device; remote URLs automatically use read-only mode.
 
 ## State and tests
 

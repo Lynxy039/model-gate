@@ -20,9 +20,12 @@ class TelemetryTests(unittest.TestCase):
             omlx = Backend('omlx', 'http://127.0.0.1:8001', 1, kind='omlx')
             open_url = MagicMock()
             open_url.return_value.__enter__.return_value.read.return_value = json.dumps({'uptime': 42}).encode()
-            with patch('model_gate.telemetry.subprocess.run', return_value=SimpleNamespace(stdout='8')) as ps:
+            host = {'kind': 'host', 'sys': {'mem_frac': 0.5}}
+            with patch('model_gate.telemetry.subprocess.run', return_value=SimpleNamespace(stdout='8')) as ps, \
+                    patch('model_gate.telemetry.collect_host', return_value=host):
                 result = collect({'ds4': ds4, 'omlx': omlx},
                     {'ds4': {'pid': 10, 'model': 'm'}, 'omlx': {'pid': 11, 'model': 'x'}}, open_url)
+            self.assertEqual(result['_host'], host)
             self.assertEqual(result['ds4']['kv_disk']['bytes'], 3)
             self.assertEqual(result['ds4']['kv_disk']['cap'], 9 * 1024**2)
             self.assertEqual(result['ds4']['rss_bytes'], 8192)
@@ -34,5 +37,7 @@ class TelemetryTests(unittest.TestCase):
     def test_unavailable_process_and_omlx_metrics_are_nonfatal(self):
         b = Backend('omlx', 'http://127.0.0.1:8001', 1, kind='omlx')
         def offline(*args, **kwargs): raise OSError('offline')
-        self.assertEqual(collect({'omlx': b}, {}, offline),
-            {'omlx': {'kind': 'omlx', 'metrics': None, 'kv_disk': None, 'rss_bytes': None}})
+        with patch('model_gate.telemetry.collect_host', return_value={'kind': 'host'}):
+            self.assertEqual(collect({'omlx': b}, {}, offline), {
+                'omlx': {'kind': 'omlx', 'metrics': None, 'kv_disk': None, 'rss_bytes': None},
+                '_host': {'kind': 'host'}})

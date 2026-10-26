@@ -26,9 +26,11 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.json'
             path.write_text('{}')
-            raw = {'version': 1, 'backends': {'ds4': {'type': 'ds4', 'binary': 'ds4-server',
+            raw = {'version': 1, 'tailscale_readonly_users': ['owner@example.com'],
+                'backends': {'ds4': {'type': 'ds4', 'binary': 'ds4-server',
                 'port': 'auto', 'models': {'flash': {'path': 'models/f.gguf', 'context': 200000}}}}}
             result = normalize(raw, path)
+            self.assertEqual(result['tailscale_readonly_users'], ['owner@example.com'])
             backend = result['backends']['ds4']
             self.assertEqual(backend['base_url'], 'http://127.0.0.1:0')
             self.assertTrue(backend['auto_port'])

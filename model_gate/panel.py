@@ -185,10 +185,12 @@ def build_targets(state: dict) -> list[dict]:
 class Actions:
     """Управляющие команды: fire-and-forget поток + строка статуса в футер."""
 
-    def __init__(self, gate_url: str, omlx_url: str, config: str | None = None):
+    def __init__(self, gate_url: str, omlx_url: str, config: str | None = None,
+                 read_only: bool = False):
         self.config = config
         self.gate_url = gate_url.rstrip("/")
         self.omlx_url = omlx_url.rstrip("/")
+        self.read_only = read_only
         self.lock = threading.Lock()
         self._status, self._expires = "", 0.0
 
@@ -205,6 +207,9 @@ class Actions:
         self._set(text)
 
     def _run(self, label: str, call) -> None:
+        if self.read_only:
+            self._set(f"{label}: read-only")
+            return
         def worker():
             try:
                 result = call()
@@ -343,11 +348,12 @@ def read_cpu_busy() -> float | None:
 # ---------------------------------------------------------------- poller
 
 class Poller(threading.Thread):
-    def __init__(self, gate_url: str, omlx_url: str, gpu: bool):
+    def __init__(self, gate_url: str, omlx_url: str, gpu: bool, remote: bool = False):
         super().__init__(daemon=True)
         self.gate_url = gate_url.rstrip("/")
         self.omlx_url = omlx_url.rstrip("/")
         self.gpu_enabled = gpu
+        self.remote = remote
         self.lock = threading.Lock()
         self.state: dict = {
             "gate_stats": None, "gate_status": None, "omlx": None,
@@ -502,10 +508,11 @@ class Poller(threading.Thread):
         return busy_pct, watts
 
     def run(self) -> None:
-        if self.gpu_enabled:
+        if self.gpu_enabled and not self.remote:
             self._start_gpu()
             threading.Thread(target=self._pump_gpu, daemon=True).start()
-        threading.Thread(target=self._pump_macmon, daemon=True).start()
+        if not self.remote:
+            threading.Thread(target=self._pump_macmon, daemon=True).start()
         cycle = 0
         while not self._stop_event.is_set():
             started = time.monotonic()
@@ -531,34 +538,56 @@ class Poller(threading.Thread):
             with self.lock:
                 self.state["gate_error"] = str(error)
         if cycle % 2 == 0:
+            telemetry = {}
             try:
                 telemetry = fetch_json(f'{self.gate_url}/admin/telemetry')
                 with self.lock:
                     self.state['telemetry'] = telemetry
                     self.state['omlx'] = next((item.get('metrics') for item in telemetry.values() if item.get('kind') == 'omlx'), {}) or {}
                     self.state['kv_disk'] = next((item.get('kv_disk') for item in telemetry.values() if item.get('kv_disk')), None)
-                    self.state['rss'] = {name: item.get('rss_bytes') for name, item in telemetry.items()}
+                    self.state['rss'] = {name: item.get('rss_bytes') for name, item in telemetry.items()
+                                         if item.get('kind') != 'host'}
             except (URLError, OSError, ValueError):
                 with self.lock:
                     self.state["omlx_error"] = "unavailable"
             try:
-                with self.lock:
-                    self.state["sys"] = read_vm_stat()
-                    self.state["hist"]["mem"].append(self.state["sys"].get("mem_frac"))
+                if self.remote:
+                    host = telemetry.get('_host', {})
+                    with self.lock:
+                        self.state['sys'] = host.get('sys', {})
+                        self.state['cpu'] = host.get('cpu')
+                        self.state['gpu_pct'] = host.get('gpu_pct')
+                        self.state['gpu_watts'] = host.get('gpu_watts')
+                        self.state['sys_watts'] = host.get('sys_watts')
+                        self.state['gpu_temp'] = host.get('gpu_temp')
+                        self.state['gpu_note'] = host.get('gpu_note', 'remote telemetry unavailable')
+                        self.state['hist']['mem'].append(self.state['sys'].get('mem_frac'))
+                        self.state['hist']['cpu'].append(self.state['cpu'])
+                        if self.state['gpu_pct'] is not None:
+                            self.state['hist']['gpu'].append(self.state['gpu_pct'])
+                        if self.state['gpu_temp'] is not None:
+                            self.state['hist']['temp'].append(self.state['gpu_temp'])
+                        if self.state['sys_watts'] is not None:
+                            self.state['hist']['watts'].append(self.state['sys_watts'])
+                else:
+                    with self.lock:
+                        self.state["sys"] = read_vm_stat()
+                        self.state["hist"]["mem"].append(self.state["sys"].get("mem_frac"))
                 pool = (self.state.get("omlx") or {}).get("active_models", {})
                 if pool.get("model_memory_max"):
                     self.state["hist"]["pool"].append(pool["model_memory_used"] / pool["model_memory_max"])
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
-        cpu = read_cpu_busy()
-        with self.lock:
-            self.state["cpu"] = cpu
-            self.state["hist"]["cpu"].append(cpu)
-        sys_watts = self._read_system_watts()
-        if sys_watts is not None:
+        if not self.remote:
+            cpu = read_cpu_busy()
             with self.lock:
-                self.state["hist"]["watts"].append(sys_watts)
-                self.state["sys_watts"] = sys_watts
+                self.state["cpu"] = cpu
+                self.state["hist"]["cpu"].append(cpu)
+            sys_watts = self._read_system_watts()
+            if sys_watts is not None:
+                with self.lock:
+                    self.state["hist"]["watts"].append(sys_watts)
+                    self.state["sys_watts"] = sys_watts
         self._update_rates()
 
     def _update_rates(self) -> None:
@@ -1200,6 +1229,8 @@ def draw(tty_: Tty, state: dict, sel: dict | None = None,
     height, width = tty_.size()
     lines = render(state, width - 1, height, sel, compact)[:height - 1]
     status = actions.status() if actions else ""
+    if actions and actions.read_only:
+        status = f"{status} · read-only" if status else "read-only"
     if state.get("poll_error"):
         # сэмпл упал: показываем причину, иначе панель молча стоит на последней картинке
         status = f"{status} · " if status else ""
@@ -1233,6 +1264,7 @@ def main() -> None:
                         help="узкий режим (боковая панель, телефон); авто при ширине <80, клавиша c переключает")
     parser.add_argument("--once", action="store_true", help="single frame to stdout, no TUI")
     parser.add_argument('--config', help='configuration file used to resolve the gate URL')
+    parser.add_argument('--read-only', action='store_true', help='disable panel actions (always enabled for remote gate URLs)')
     parser.add_argument("--theme", default="",
                         help=f"палитра ({', '.join(THEMES)}); по умолчанию — последняя выбранная по T")
     args = parser.parse_args()
@@ -1243,8 +1275,10 @@ def main() -> None:
         args.url = f'http://{host}:{port}'
     if args.theme:
         apply_theme(args.theme)
+    remote = (urlsplit(args.url).hostname or '').lower() not in {'127.0.0.1', '::1', 'localhost'}
+    read_only = args.read_only or remote
 
-    if args.gpu:
+    if args.gpu and not remote:
         # NOPASSWD-правило в sudoers (см. README) отбывает здесь же; без него — как раньше
         probe = subprocess.run(["sudo", "-n", "powermetrics", "--samplers",
                                 "gpu_power,cpu_power,battery,thermal", "-i", "100", "-n", "1"],
@@ -1255,7 +1289,7 @@ def main() -> None:
                 print("sudo denied — GPU%% stays off")
                 args.gpu = False
 
-    poller = Poller(args.url, args.omlx_url or args.url, args.gpu)
+    poller = Poller(args.url, args.omlx_url or args.url, args.gpu, remote=remote)
     if args.once:
         thread = threading.Thread(target=poller.run, daemon=True)
         thread.start()
@@ -1269,7 +1303,7 @@ def main() -> None:
         poller.stop()
         return
 
-    actions = Actions(args.url, args.omlx_url, args.config)
+    actions = Actions(args.url, args.omlx_url, args.config, read_only=read_only)
     paused, scroll, sel_index, restart = False, 0, 0, False
     focused = True  # DEC 1004 приходит только на смене фокуса — стартуем «в фокусе»
     with Tty() as tty_, ExitStack() as cleanup:
