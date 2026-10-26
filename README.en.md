@@ -69,7 +69,13 @@ export MODEL_GATE_URL="https://<gate-device>.<tailnet-domain>.ts.net"
 mgpan --url "$MODEL_GATE_URL" --read-only
 ```
 
-Replace the placeholder in the example with the HTTPS MagicDNS URL shown by `tailscale serve status`. For Pi, configure an `openai-completions` provider at `https://<gate-device>.<tailnet-domain>.ts.net/v1`, with `apiKey: "none"` and model ID `local-auto`. Remote `mgpan` reads system telemetry from the gate host, not the client device; remote URLs automatically use read-only mode.
+Replace the placeholder in the example with the HTTPS MagicDNS URL shown by `tailscale serve status`. For Pi, configure an `openai-completions` provider at `https://<gate-device>.<tailnet-domain>.ts.net/v1`, with `apiKey: "none"` and model ID `local-auto`.
+
+Remote `mgpan` reads system telemetry from the gate host, not the client device; remote URLs automatically use read-only mode. The `mgpan` client supports native Windows Terminal; the gate itself remains a macOS service. In PowerShell, pass the URL directly:
+
+```powershell
+mgpan --url "https://<gate-device>.<tailnet-domain>.ts.net" --read-only
+```
 
 ## State and tests
 

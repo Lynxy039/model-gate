@@ -9,7 +9,6 @@ omlx /admin/api/stats, vm_stat/top/sysctl, опционально sudo powermetr
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -19,10 +18,8 @@ import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
-import tty
 from collections import deque
 from contextlib import ExitStack
 from datetime import datetime
@@ -30,6 +27,12 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+IS_WINDOWS = os.name == "nt"
+if not IS_WINDOWS:
+    import fcntl
+    import termios
+    import tty
 
 EIGHTHS = " ▁▂▃▄▅▆▇█"
 HISTORY = 150
@@ -1153,6 +1156,44 @@ def render(state: dict, width: int, height: int, sel: dict | None = None,
     return lines
 
 
+def _enable_windows_vt():
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+        handle = kernel32.GetStdHandle(wintypes.DWORD(-11 & 0xFFFFFFFF))
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return None
+        original = mode.value
+        if not kernel32.SetConsoleMode(handle, original | 0x0004):
+            return None
+        return handle, original
+    except (AttributeError, OSError):
+        return None
+
+
+def _restore_windows_vt(state) -> None:
+    if state is None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        handle, mode = state
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode(handle, mode)
+    except (AttributeError, OSError):
+        pass
+
+
 class Tty:
     """Raw-ANSI рендер: alt-screen, truecolor, сырой ввод — как у Pi, без ncurses."""
 
@@ -1161,8 +1202,11 @@ class Tty:
 
     def __enter__(self) -> "Tty":
         self.fd = sys.stdin.fileno()
-        self.old = termios.tcgetattr(self.fd)
-        tty.setraw(self.fd)
+        if IS_WINDOWS:
+            self.old = _enable_windows_vt()
+        else:
+            self.old = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
         # 1004 — отчёт о фокусе поверхности: нужен, чтобы красить рамку активного окна
         sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1004h")
         sys.stdout.flush()
@@ -1171,9 +1215,15 @@ class Tty:
     def __exit__(self, *exc) -> None:
         sys.stdout.write("\x1b[0m\x1b[?1004l\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        if IS_WINDOWS:
+            _restore_windows_vt(self.old)
+        else:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
     def size(self) -> tuple[int, int]:
+        if IS_WINDOWS:
+            fallback = shutil.get_terminal_size()
+            return fallback.lines, fallback.columns
         try:
             rows, cols = struct.unpack("HH", fcntl.ioctl(self.fd, termios.TIOCGWINSZ, b"\x00" * 8)[:4])
             return int(rows), int(cols)
@@ -1197,7 +1247,24 @@ class Tty:
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
 
+    def _windows_key(self, timeout: float) -> str | None:
+        import msvcrt
+        deadline = time.monotonic() + timeout
+        while not msvcrt.kbhit():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(.01, remaining))
+        value = msvcrt.getwch()
+        if value in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT",
+                    "I": "PgUp", "Q": "PgDn", "G": "HOME", "O": "END"}.get(code)
+        return "ESC" if value == "\x1b" else value
+
     def key(self, timeout: float) -> str | None:
+        if IS_WINDOWS:
+            return self._windows_key(timeout)
         incomplete_csi = self._input.startswith(b"\x1b[") and not re.match(rb"\x1b\[[0-?]*[ -/]*[@-~]", self._input)
         if not self._input or self._input == b"\x1b" or incomplete_csi:
             if select.select([self.fd], [], [], timeout)[0]:

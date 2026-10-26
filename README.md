@@ -218,7 +218,10 @@ mgpan --url "$MODEL_GATE_URL" --read-only
 `api: "openai-completions"`, `apiKey: "none"` и единственной моделью
 `id: "local-auto"`. Панель получает RAM/CPU/GPU gate-хоста через telemetry, а не
 показывает ресурсы клиентского устройства. Для удалённых URL `mgpan` автоматически
-работает read-only; переключение моделей выполняйте локально.
+работает read-only; переключение моделей выполняйте локально. Клиент `mgpan`
+поддерживает нативный Windows Terminal; сам gate остаётся macOS-сервисом.
+В PowerShell URL можно передать напрямую:
+`mgpan --url "https://<gate-device>.<tailnet-domain>.ts.net" --read-only`.
 
 KV-каталоги содержат текст промптов и состояние модели: не публикуйте их и
 не удаляйте файлы при работающем сервере. `K` удаляет только обычные `.kv`,

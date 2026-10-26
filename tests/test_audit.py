@@ -307,6 +307,25 @@ class PanelAuditTests(unittest.TestCase):
             self.assertIsNone(terminal.key(0))
             self.assertEqual(terminal.key(0), "UP")
 
+    def test_windows_tty_maps_extended_console_keys(self):
+        msvcrt = Mock()
+        msvcrt.kbhit.return_value = True
+        msvcrt.getwch.side_effect = ["\xe0", "H"]
+        with patch.dict("sys.modules", {"msvcrt": msvcrt}):
+            self.assertEqual(panel.Tty()._windows_key(0.1), "UP")
+
+    def test_windows_tty_reads_terminal_size_without_ioctl(self):
+        size = SimpleNamespace(lines=40, columns=120)
+        with patch("model_gate.panel.IS_WINDOWS", True), \
+                patch("model_gate.panel.shutil.get_terminal_size", return_value=size):
+            self.assertEqual(panel.Tty().size(), (40, 120))
+
+    def test_windows_tty_routes_key_reads_to_console_backend(self):
+        with patch("model_gate.panel.IS_WINDOWS", True), \
+                patch.object(panel.Tty, "_windows_key", return_value="UP") as read_key:
+            self.assertEqual(panel.Tty().key(0.1), "UP")
+        read_key.assert_called_once_with(0.1)
+
     def test_remote_panel_uses_gate_host_telemetry_not_client_machine(self):
         poller = panel.Poller("https://gate-device.tailnet.example", "", False, remote=True)
         host = {'kind': 'host', 'sys': {'mem_total': 100, 'mem_used': 70, 'mem_frac': .7},
